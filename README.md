@@ -1,1 +1,1 @@
-# Efficient Sparse Inference Engine (ESIE)
+# Efficient Sparse Inference Engine (esie)
