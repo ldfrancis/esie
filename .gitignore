@@ -1,0 +1,4 @@
+# ignore virtual envs
+.venv
+
+build/
