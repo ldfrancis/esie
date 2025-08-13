@@ -3,9 +3,17 @@
 
 
 
-LlamaForCausalLM::LlamaForCausalLM(const std::string& model_path){
-        std::cout << "Loading Llama model from: " << model_path << std::endl;
-        
+LlamaForCausalLM::LlamaForCausalLM(int vocab_size, int hidden_size, int intermediate_size, int num_attention_heads, 
+        int num_key_value_heads, int max_position_embeddings, float rope_theta, 
+        float partial_rotary_factor, int head_dim, int num_hidden_layers, float* weight, 
+        float rms_norm_eps) : 
+        hidden_size(hidden_size),
+        model(vocab_size, hidden_size, intermediate_size, num_attention_heads, 
+        num_key_value_heads, max_position_embeddings, rope_theta, partial_rotary_factor, head_dim, 
+        num_hidden_layers, weight, rms_norm_eps), 
+        lm_head(hidden_size, vocab_size, weight, nullptr) {
+    std::cout << "Loading Llama model..." << std::endl;
+    this->set_weight(weight);
 }
 
 
@@ -14,6 +22,12 @@ LlamaForCausalLM::~LlamaForCausalLM(){
         // TODO
 }
 
+void LlamaForCausalLM::forward(float* output, const int* input, int batch_size, int seq_len){
+    float* buffer = new float[batch_size*seq_len*this->hidden_size];
+    this->model.forward(buffer, input, batch_size, seq_len);
+    this->lm_head.forward(output, buffer, batch_size, seq_len);
+    delete[] buffer;
+}
 
 EmbedTokens::EmbedTokens(int vocab_size, int hidden_size, float* weight) {
     std::cout << "Loading embedding tokens..." << std::endl;
@@ -99,19 +113,26 @@ LlamaAttention::~LlamaAttention() {
     // Linear objects will be automatically destroyed
 }
 
-void LlamaAttention::forward(float* output, const float* input, int batch_size, int seq_len) {
+void LlamaAttention::forward(float* output, const float* input, const float* cos, const float* sin, 
+    int batch_size, int seq_len) {
     std::cout << "Forward pass through LlamaAttention...\n To be optimized later" << std::endl;
     // TODO: Optimize the attention mechanism -> flash attention, etc.
     // TODO: Work on the KV Caching
     // Apply the projection layers
-    float* q_ = new float[batch_size * seq_len * this->hidden_size];
-    float* k_ = new float[batch_size * seq_len * this->hidden_size];
+    float* q__ = new float[batch_size * seq_len * this->hidden_size];
+    float* k__ = new float[batch_size * seq_len * this->hidden_size];
     float* v_ = new float[batch_size * seq_len * this->hidden_size];
+
+    float* q_ = new float[batch_size*seq_len*this->hidden_size];
+    float* k_ = new float[batch_size*seq_len*this->hidden_size];
+
     float* attn_scores_ = new float[batch_size * seq_len * seq_len * this->num_attention_heads];
 
-    this->q_proj.forward(q_, input, batch_size, seq_len);
-    this->k_proj.forward(k_, input, batch_size, seq_len);
+    this->q_proj.forward(q__, input, batch_size, seq_len);
+    this->k_proj.forward(k__, input, batch_size, seq_len);
     this->v_proj.forward(v_, input, batch_size, seq_len);
+
+    LlamaAttention::apply_rotary_pos_embedding(q_, k_, q__, k__, cos, sin, batch_size, seq_len, num_attention_heads, head_dim);
 
     // Compute attention scores and apply softmax
     for (int i = 0; i < batch_size; ++i) {
@@ -271,12 +292,13 @@ LlamaDecoderLayer::~LlamaDecoderLayer() {
 }
 
 
-void LlamaDecoderLayer::forward(float* output, const float* input, int batch_size, int seq_len) {
+void LlamaDecoderLayer::forward(float* output, const float* input, const float* cos, const float* sin, 
+    int batch_size, int seq_len) {
     std::cout << "Forward pass through LlamaDecoderLayer..." << std::endl;
     float* temp_output = new float[batch_size * seq_len * hidden_size];
 
     this->input_layernorm.forward(output, input, batch_size, seq_len);
-    this->self_attn.forward(output, output, batch_size, seq_len);
+    this->self_attn.forward(output, output, cos, sin, batch_size, seq_len);
 
     for(int i = 0; i < batch_size * seq_len * hidden_size; ++i) {
         output[i] += input[i]; // Residual connection
@@ -361,7 +383,7 @@ LlamaModel::LlamaModel(int vocab_size, int hidden_size, int intermediate_size, i
      float rms_norm_eps):
  vocab_size(vocab_size), num_hidden_layers(num_hidden_layers), hidden_size(hidden_size),
  intermediate_size(intermediate_size), embed_tokens(vocab_size, hidden_size, weight),
- norm(weight, rms_norm_eps, hidden_size),
+ head_dim(head_dim), norm(weight, rms_norm_eps, hidden_size),
  rotary_embedding(hidden_size, max_position_embeddings, rope_theta, partial_rotary_factor, head_dim)
  {
     std::cout << "Initializing LlamaModel with vocab size: " << vocab_size << ", hidden size: " 
@@ -388,6 +410,25 @@ LlamaModel::~LlamaModel() {
     std::cout << "Destroying LlamaModel..." << std::endl;
 }
 
-void LlamaModel::forward(float* output, const float* input, int batch_size, int seq_len) {
-    
+void LlamaModel::forward(float* output, const int* input, int batch_size, int seq_len) {
+    float* embeds = new float[batch_size * seq_len * hidden_size];
+    float* buffer = new float[batch_size * seq_len * hidden_size];
+    int* position_ids = new int[batch_size * seq_len];
+    this->embed_tokens.forward(embeds, input, batch_size, seq_len);
+    float* cos = new float[batch_size*seq_len*this->head_dim];
+    float* sin = new float[batch_size*seq_len*this->head_dim];
+    this->rotary_embedding.forward(cos, sin, embeds, position_ids, batch_size, seq_len);
+
+    for (int i=0; i<this->num_hidden_layers; ++i){
+        this->layers[i].forward(buffer, embeds, cos, sin, batch_size, seq_len);
+        std::swap(embeds, buffer);
+    }
+
+    this->norm.forward(output, embeds, batch_size, seq_len);
+
+    delete[] embeds;
+    delete[] buffer;
+    delete[] position_ids;
+    delete[] cos;
+    delete[] sin;
 }
