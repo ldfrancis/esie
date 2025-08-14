@@ -271,8 +271,7 @@ void LlamaRMSNorm::forward(float* output, const float* input, int batch_size, in
 }
 
 
-LlamaDecoderLayer::LlamaDecoderLayer(int hidden_size, int intermediate_size, int num_attention_heads,
-     int layer_index, int num_key_value_heads, float* weight, float rms_norm_eps):
+LlamaDecoderLayer::LlamaDecoderLayer(int hidden_size, int intermediate_size, int num_attention_heads, int layer_index, int num_key_value_heads, float* weight, float rms_norm_eps):
     hidden_size(hidden_size), layer_idx(layer_index),
     input_layernorm(weight, rms_norm_eps, hidden_size),
     self_attn_weight(weight), mlp_weight(weight + 4 * hidden_size * hidden_size),
@@ -395,8 +394,7 @@ LlamaModel::LlamaModel(int vocab_size, int hidden_size, int intermediate_size, i
 
     // Initialize model components
     for (int i = 0; i < num_hidden_layers; ++i) {
-        this->layers.emplace_back(hidden_size, intermediate_size, num_attention_heads, i,
-            num_key_value_heads, weight_itr);
+        this->layers.emplace_back(hidden_size, intermediate_size, num_attention_heads, i, num_key_value_heads, weight_itr, rms_norm_eps);
         weight_itr = weight_itr + hidden_size; // input layer norm
         weight_itr = weight_itr + 4 * hidden_size * hidden_size; // attention
         weight_itr = weight_itr + 3 * (hidden_size * intermediate_size); // MLP

@@ -69,7 +69,7 @@ public:
         float partial_rotary_factor, int head_dim);
     ~LlamaRotaryEmbedding();
 
-    void LlamaRotaryEmbedding::forward(float* cos, float* sin, const float* input, 
+    void forward(float* cos, float* sin, const float* input, 
         const int* position_ids, int batch_size, int seq_len);
     void rope_init_fn(float rope_theta, float partial_rotary_factor, int head_dim);
 };
@@ -192,8 +192,7 @@ private:
     LlamaRMSNorm post_attention_layernorm;
 
 public:
-    LlamaDecoderLayer(int hidden_size, int intermediate_size, int num_attention_heads, 
-        int layer_index, int num_key_value_heads, float* weight, float rms_norm_eps);
+    LlamaDecoderLayer(int hidden_size, int intermediate_size, int num_attention_heads, int layer_index, int num_key_value_heads, float* weight, float rms_norm_eps);
     ~LlamaDecoderLayer();
 
 
