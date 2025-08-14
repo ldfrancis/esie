@@ -22,8 +22,9 @@ int main(int argc, char* argv[]) {
     int num_hidden_layers = 32;
     float rms_norm_eps = 1e-5;
 
-    float* weight = new float[6738415616]; // Placeholder for weight array, should be loaded from a file
-    for(long i = 0; i < 6738415616; ++i) {
+    long total_weight_size = 6738415616;
+    float* weight = new float[total_weight_size]; // Placeholder for weight array, should be loaded from a file
+    for(long i = 0; i < total_weight_size; ++i) {
         weight[i] = static_cast<float>(i % 100) / 100.0f; // Example initialization, replace with actual weights
     }
 
@@ -36,6 +37,10 @@ int main(int argc, char* argv[]) {
     int input_ids[2][4] = {
         {1, 2, 3, 4},
         {5, 6, 7, 8}
+    };
+    int position_ids[2][4] = {
+        {0, 1, 2, 3},
+        {0, 1, 2, 3}
     };
     int batch_size = 2;
     int seq_len = 4;
@@ -51,12 +56,12 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    llama_model.forward(output, (const int*)input_ids, batch_size, seq_len);
+    llama_model.forward(output, (const int*)input_ids, (const int*)position_ids, batch_size, seq_len);
 
     std::cout << "Output from LlamaForCausalLM:" << std::endl;
     for (int i = 0; i < batch_size; ++i) {
         for (int j = 0; j < seq_len; ++j) {
-            for (int k = 0; k < vocab_size; ++k) {
+            for (int k = 0; k < 10; ++k) {
                 std::cout << output[i * seq_len * vocab_size + j * vocab_size + k] << " ";
             }
             std::cout << std::endl;

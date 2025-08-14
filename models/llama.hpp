@@ -6,6 +6,7 @@
 
 class EmbedTokens{
 public:
+    EmbedTokens(): vocab_size(0), hidden_size(0), weight(nullptr) {}
     EmbedTokens(int vocab_size, int hidden_size, float* weight);
     ~EmbedTokens();
 
@@ -17,6 +18,11 @@ public:
     void set_weight(float* new_weight) {
         this->weight = new_weight;
     }
+    size_t get_weight_size() const{
+        size_t size=0;
+        size += vocab_size * hidden_size;
+        return size;
+    }
 };
 
 
@@ -27,12 +33,16 @@ private:
     float* weight;
     float* bias;
 public:
+    Linear(): input_dim(0), output_dim(0), weight(nullptr), bias(nullptr) {}
     Linear(int in_features, int out_features, float* weight, float* bias);
     ~Linear();
 
     void forward(float* output, const float* input, int batch_size, int seq_len);
     void set_weight(float* new_weight) {
         this->weight = new_weight;
+    }
+    size_t get_input_dim(){
+        return input_dim;
     }
 };
 
@@ -43,12 +53,18 @@ private:
     float variance_epsilon;
     int hidden_size;
 public:
+    LlamaRMSNorm(): weight(nullptr), variance_epsilon(1e-6), hidden_size(0) {}
     LlamaRMSNorm(float* weight, float variance_epsilon, int hidden_size );
     ~LlamaRMSNorm();
 
     void forward(float* output, const float* input, int batch_size, int seq_len);
     void set_weight(float* new_weight) {
         this->weight = new_weight;
+    }
+    size_t get_weight_size() const{
+        size_t size = 0;
+        size += hidden_size;
+        return size;
     }
 };
 
@@ -65,6 +81,9 @@ private:
     float* original_inv_freq;
 
 public:
+    LlamaRotaryEmbedding(): max_seq_len_cached(0), original_max_seq_len(0), 
+        rope_theta(0.0f), partial_rotary_factor(0.0f), head_dim(0), 
+        attention_scaling(1.0f), inv_freqs(nullptr), original_inv_freq(nullptr) {}
     LlamaRotaryEmbedding(int hidden_size, int max_position_embeddings, float rope_theta, 
         float partial_rotary_factor, int head_dim);
     ~LlamaRotaryEmbedding();
@@ -83,7 +102,7 @@ private:
     int hidden_size;
     int layer_index;
     int num_key_value_groups;
-    int scaling;
+    float scaling;
 
     Linear q_proj;
     Linear k_proj;
@@ -91,6 +110,7 @@ private:
     Linear o_proj;
 
 public:
+    LlamaAttention(): hidden_dim(0), num_attention_heads(0), head_dim(0), hidden_size(0), layer_index(0), num_key_value_groups(0), scaling(1.0f) {}
     LlamaAttention(int hidden_size, int num_attention_heads, int layer_index, 
         int num_key_value_heads, float* weight);
     ~LlamaAttention();
@@ -100,11 +120,11 @@ public:
     void set_weight(float* new_weight) {
         float* weight_ptr = new_weight;
         this->q_proj.set_weight(weight_ptr);
-        weight_ptr += hidden_size * hidden_size;
+        weight_ptr += (static_cast<size_t>(hidden_size) * static_cast<size_t>(hidden_size));
         this->k_proj.set_weight(weight_ptr);
-        weight_ptr += hidden_size * hidden_size;
+        weight_ptr += (static_cast<size_t>(hidden_size) * static_cast<size_t>(hidden_size));
         this->v_proj.set_weight(weight_ptr);
-        weight_ptr += hidden_size * hidden_size;
+        weight_ptr += (static_cast<size_t>(hidden_size) * static_cast<size_t>(hidden_size));
         this->o_proj.set_weight(weight_ptr);
     }
 
@@ -113,6 +133,8 @@ public:
         int batch_size, int seq_len, int num_attention_heads, int head_dim) {
         for (int i = 0; i < batch_size; ++i) {
             for (int j = 0; j < seq_len; ++j) {
+                const float* cos_seek = cos + j*head_dim;
+                const float* sin_seek = sin + j*head_dim;
                 for (int h = 0; h < num_attention_heads; ++h) {
                     float *q_output_seek = q_output + i*seq_len*num_attention_heads*head_dim+
                         j*num_attention_heads*head_dim+h*head_dim;
@@ -122,8 +144,6 @@ public:
                         j*num_attention_heads*head_dim+h*head_dim;
                     const float* k_seek = k + i*seq_len*num_attention_heads*head_dim+
                         j*num_attention_heads*head_dim+h*head_dim;
-                    const float* cos_seek = cos + j*head_dim;
-                    const float* sin_seek = sin + j*head_dim;
                     int half_dim = head_dim/2;
                     for (int d = 0; d < head_dim; ++d) {
                         int ind_rot = (d + half_dim) % head_dim;
@@ -143,7 +163,7 @@ public:
     SiLU();
     ~SiLU();
 
-    void forward(float* output, const float* input, int batch_size, int seq_len);
+    void forward(float* output, const float* input, int batch_size, int seq_len, int dim);
 };
 
 
@@ -158,6 +178,7 @@ private:
     SiLU act_fn;
 
 public:
+    LlamaMLP(): hidden_size(0), intermediate_size(0), gate_proj(), up_proj(), down_proj(), act_fn() {}
     LlamaMLP(int hidden_size, int intermediate_size, float* weight);
     ~LlamaMLP();
 
@@ -165,9 +186,9 @@ public:
     void set_weight(float* new_weight) {
         float* weight_ptr = new_weight;
         this->gate_proj.set_weight(weight_ptr);
-        weight_ptr += hidden_size * intermediate_size;
+        weight_ptr += static_cast<size_t>(hidden_size) * static_cast<size_t>(intermediate_size);
         this->up_proj.set_weight(weight_ptr);
-        weight_ptr += hidden_size * intermediate_size;
+        weight_ptr += static_cast<size_t>(hidden_size) * static_cast<size_t>(intermediate_size);
         this->down_proj.set_weight(weight_ptr);
     }
 };
@@ -178,6 +199,7 @@ void sigmoid(float* output, const float* input, int batch_size, int seq_len);
 class LlamaDecoderLayer{
 private:
     int hidden_size;
+    int intermediate_size;
     int layer_idx;
     int num_attention_heads;
     int num_key_value_heads;
@@ -192,6 +214,7 @@ private:
     LlamaRMSNorm post_attention_layernorm;
 
 public:
+    LlamaDecoderLayer(): hidden_size(0), intermediate_size(0), layer_idx(0), num_attention_heads(0), num_key_value_heads(0), rms_norm_eps(0.0f), self_attn_weight(nullptr), mlp_weight(nullptr), self_attn(), mlp(), input_layernorm(), post_attention_layernorm() {}
     LlamaDecoderLayer(int hidden_size, int intermediate_size, int num_attention_heads, int layer_index, int num_key_value_heads, float* weight, float rms_norm_eps);
     ~LlamaDecoderLayer();
 
@@ -200,13 +223,22 @@ public:
          int seq_len);
     void set_weight(float* new_weight) {
         float* weight_ptr = new_weight;
-        this->input_layernorm.set_weight(weight_ptr);
-        weight_ptr += this->hidden_size;
-        this->self_attn.set_weight(weight_ptr);
-        weight_ptr += 4 * hidden_size * hidden_size;
-        this->mlp.set_weight(weight_ptr);
-        weight_ptr += 3 * hidden_size * hidden_size;
-        this->post_attention_layernorm.set_weight(weight_ptr);
+        input_layernorm.set_weight(weight_ptr);
+        weight_ptr += hidden_size;
+        self_attn.set_weight(weight_ptr);
+        weight_ptr += 4ull * static_cast<size_t>(hidden_size) * static_cast<size_t>(hidden_size);
+        mlp.set_weight(weight_ptr);
+        weight_ptr += 3ull * (static_cast<size_t>(hidden_size) * static_cast<size_t>(intermediate_size));
+        post_attention_layernorm.set_weight(weight_ptr);
+    }
+
+    size_t get_weight_size() const{
+        size_t size = 0;
+        size += hidden_size;
+        size += 4 * hidden_size * hidden_size;
+        size += 3 * (hidden_size * intermediate_size);
+        size += hidden_size;
+        return size;
     }
 
 };
@@ -225,34 +257,35 @@ private:
     LlamaRotaryEmbedding rotary_embedding;
 
 public:
+    LlamaModel(): vocab_size(0), num_hidden_layers(0), hidden_size(0), intermediate_size(0), head_dim(0), embed_tokens(), layers(), norm(), rotary_embedding() {}
     LlamaModel(int vocab_size, int hidden_size, int intermediate_size, int num_attention_heads, 
         int num_key_value_heads, int max_position_embeddings, float rope_theta, 
         float partial_rotary_factor, int head_dim, int num_hidden_layers, float* weight, 
         float rms_norm_eps);
     ~LlamaModel();
 
-    void forward(float* output, const int* input, int batch_size, int seq_len);
+    void forward(float* output, const int* input, const int* position_ids, int batch_size, int seq_len);
     void set_weight(float* new_weight) {
         float* weight_itr = new_weight;
         this->embed_tokens.set_weight(weight_itr);
-        weight_itr += this->vocab_size * this->hidden_size;
-        for(int i=0; i<this->num_hidden_layers; ++i) {
-            this->layers[i].set_weight(weight_itr);
-            weight_itr = weight_itr + hidden_size; // input layer norm
-            weight_itr = weight_itr + 4 * hidden_size * hidden_size; // attention
-            weight_itr = weight_itr + 3 * (hidden_size * this->intermediate_size); // MLP
-            weight_itr = weight_itr + hidden_size; // post attention layer norm
+        weight_itr += static_cast<size_t>(vocab_size) * static_cast<size_t>(hidden_size);
+        for(auto& layer : layers) {
+            layer.set_weight(weight_itr);
+            weight_itr += hidden_size; // input layer norm
+            weight_itr += 4ull * static_cast<size_t>(hidden_size) * static_cast<size_t>(hidden_size); // attention
+            weight_itr += 3ull * static_cast<size_t>(hidden_size) * static_cast<size_t>(intermediate_size); // MLP
+            weight_itr += hidden_size; // post attention layer norm
         }
         this->norm.set_weight(weight_itr); // Set the weight for the final layer norm
     }
 
-    int get_weight_size(){
-        int size = 0;
-        size += (this->vocab_size*this->hidden_size + 
-          this->num_hidden_layers*(this->hidden_size + 4*(this->hidden_size*this->hidden_size) + 
-          3*(this->hidden_size * this->intermediate_size) + this->hidden_size) + 
-          this->hidden_size
-        );
+    size_t get_weight_size() const{
+        size_t size = 0;
+        size += embed_tokens.get_weight_size();
+        for (const auto& layer : layers) {
+            size += layer.get_weight_size();
+        }
+        size += norm.get_weight_size();
         return size;
     }
 };
@@ -266,6 +299,7 @@ private:
     Linear lm_head;
     LlamaModel model;
 public:
+    LlamaForCausalLM(): hidden_size(0), lm_head(), model() {}
     LlamaForCausalLM(int vocab_size, int hidden_size, int intermediate_size, int num_attention_heads, 
         int num_key_value_heads, int max_position_embeddings, float rope_theta, 
         float partial_rotary_factor, int head_dim, int num_hidden_layers, float* weight, 
@@ -277,7 +311,7 @@ public:
         this->lm_head.set_weight(new_weight + model.get_weight_size());
     }
 
-    void forward(float* output, const int* input, int batch_size, int seq_len);
+    void forward(float* output, const int* input, const int* position_ids, int batch_size, int seq_len);
 
 };
 

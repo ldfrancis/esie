@@ -6,13 +6,27 @@
 # GPT-OSS
 
 # Possibly Vision Models
-
-
+import struct
+import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
 
 model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf", torch_dtype='auto')
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
 tokens = tokenizer.encode("How far", return_tensors="pt")
+
+decoder_model = model.model
+lm_head = model.lm_head
+embed_tokens = decoder_model.embed_tokens
+layers = decoder_model.layers
+
+# save the model weights to a .bin file
+with open("model_weights.bin", "wb") as f:
+    # write header
+    header = np.zeros(256, dtype=np.int32)
+    for name, param in model.named_parameters():
+        breakpoint()
+
 breakpoint()
 model.generate(tokens)
 
