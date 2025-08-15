@@ -59,6 +59,7 @@ int test_llama2_7b() {
 
     float* weight = reinterpret_cast<float*>(buffer2);
     l.set_weight(weight);
+    file.close();
 
     int tokens[1][3] = {{1, 1128, 2215}};
     int position_ids[1][3] = {{0, 1, 2}};
@@ -73,6 +74,7 @@ int test_llama2_7b() {
     }
     float* target_logits = new float[1*3*vocab_size];
     file2.read(reinterpret_cast<char*>(target_logits), 1*3*vocab_size*sizeof(float));
+    file2.close();
 
     // compare logits to target logits
     for(int i=0; i<3*vocab_size; i++){
@@ -88,5 +90,6 @@ int test_llama2_7b() {
     delete[] buffer2;
     delete[] logits;
     delete[] target_logits;
+    file2.close();
     return 0;
 }
