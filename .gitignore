@@ -2,3 +2,5 @@
 .venv
 
 build/
+a.out
+weights/

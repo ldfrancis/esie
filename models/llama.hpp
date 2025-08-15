@@ -2,18 +2,18 @@
 #include <vector>
 
 
-
-
 class EmbedTokens{
+private:
+    float* weight;
+    int vocab_size;
+    int hidden_size;
+
 public:
     EmbedTokens(): vocab_size(0), hidden_size(0), weight(nullptr) {}
     EmbedTokens(int vocab_size, int hidden_size, float* weight);
     ~EmbedTokens();
 
-    float* weight;
-    int vocab_size;
-    int hidden_size;
-
+    
     void forward(float* output, const int* input_ids, int batch_size, int seq_len);
     void set_weight(float* new_weight) {
         this->weight = new_weight;
@@ -40,6 +40,14 @@ public:
     void forward(float* output, const float* input, int batch_size, int seq_len);
     void set_weight(float* new_weight) {
         this->weight = new_weight;
+    }
+    size_t get_weight_size() const{
+        size_t size = 0;
+        size += static_cast<size_t>(input_dim) * static_cast<size_t>(output_dim);
+        if (bias) {
+            size += static_cast<size_t>(output_dim);
+        }
+        return size;
     }
     size_t get_input_dim(){
         return input_dim;
@@ -128,6 +136,15 @@ public:
         this->o_proj.set_weight(weight_ptr);
     }
 
+    size_t get_weight_size(){
+        size_t size = 0;
+        size += q_proj.get_weight_size();
+        size += k_proj.get_weight_size();
+        size += v_proj.get_weight_size();
+        size += o_proj.get_weight_size();
+        return size;
+    }
+
     static void apply_rotary_pos_embedding(float* q_output, float* k_output, const float* q,
          const float* k, const float* cos, const float* sin, 
         int batch_size, int seq_len, int num_attention_heads, int head_dim) {
@@ -191,6 +208,13 @@ public:
         weight_ptr += static_cast<size_t>(hidden_size) * static_cast<size_t>(intermediate_size);
         this->down_proj.set_weight(weight_ptr);
     }
+    size_t get_weight_size() const {
+        size_t size = 0;
+        size += gate_proj.get_weight_size();
+        size += up_proj.get_weight_size();
+        size += down_proj.get_weight_size();
+        return size;
+    }
 };
 
 void sigmoid(float* output, const float* input, int batch_size, int seq_len);
@@ -221,23 +245,26 @@ public:
 
     void forward(float* output, const float* input, const float* cos, const float* sin, int batch_size,
          int seq_len);
+         
     void set_weight(float* new_weight) {
         float* weight_ptr = new_weight;
-        input_layernorm.set_weight(weight_ptr);
-        weight_ptr += hidden_size;
         self_attn.set_weight(weight_ptr);
-        weight_ptr += 4ull * static_cast<size_t>(hidden_size) * static_cast<size_t>(hidden_size);
+        weight_ptr += self_attn.get_weight_size();
         mlp.set_weight(weight_ptr);
-        weight_ptr += 3ull * (static_cast<size_t>(hidden_size) * static_cast<size_t>(intermediate_size));
+        weight_ptr += mlp.get_weight_size();
+        input_layernorm.set_weight(weight_ptr);
+        weight_ptr += input_layernorm.get_weight_size();
         post_attention_layernorm.set_weight(weight_ptr);
     }
 
     size_t get_weight_size() const{
         size_t size = 0;
-        size += hidden_size;
-        size += 4 * hidden_size * hidden_size;
-        size += 3 * (hidden_size * intermediate_size);
-        size += hidden_size;
+        size_t hs = static_cast<size_t>(hidden_size);
+        size_t is = static_cast<size_t>(intermediate_size);
+        size += hs;
+        size += 4ull * hs * hs;
+        size += 3ull * hs * is;
+        size += hs;
         return size;
     }
 
@@ -309,6 +336,13 @@ public:
     void set_weight(float* new_weight) {
         this->model.set_weight(new_weight);
         this->lm_head.set_weight(new_weight + model.get_weight_size());
+    }
+
+    size_t get_weight_size(){
+        size_t size = 0;
+        size += lm_head.get_weight_size();
+        size += model.get_weight_size();
+        return size;
     }
 
     void forward(float* output, const int* input, const int* position_ids, int batch_size, int seq_len);
