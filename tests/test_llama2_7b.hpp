@@ -1,4 +1,3 @@
-// Online C++ compiler to run C++ program online
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -7,7 +6,7 @@
 
 int test_llama2_7b() {
     // config ints
-    int vocab_size; // Example vocabulary size, adjust as needed
+    int vocab_size; 
     int hidden_size;
     int intermediate_size;
     int num_attention_heads;
@@ -16,12 +15,11 @@ int test_llama2_7b() {
     int head_dim;
     int num_hidden_layers;
 
-    // floats
+    // config floats
     float rms_norm_eps;
     float rope_theta;
     float partial_rotary_factor;
 
-    // Write C++ code here
     std::ifstream file("../weights/llama2_7b_weights_fp32.bin", std::ios::in|std::ios::binary);
     if(!file.is_open()){
         std::cerr << "Error opening file!" << std::endl;
