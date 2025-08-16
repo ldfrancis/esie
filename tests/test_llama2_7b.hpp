@@ -1,7 +1,8 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
-#include "models/llama.hpp"
+#include <chrono>
+#include "esie/models/llama.hpp"
 
 
 int test_llama2_7b() {
@@ -64,7 +65,13 @@ int test_llama2_7b() {
     int tokens[1][3] = {{1, 1128, 2215}};
     int position_ids[1][3] = {{0, 1, 2}};
     float* logits = new float[1*3*vocab_size];
+
+    // calculate the time for one forward pass
+    auto start = std::chrono::high_resolution_clock::now();
     l.forward(logits, (const int*)tokens, (const int*)position_ids, 1, 3);
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    std::cout << "Time for one forward pass: " << elapsed.count() << " seconds" << std::endl;
 
     // load logits
     std::ifstream file2("../weights/llama2_7b_logits.bin", std::ios::in|std::ios::binary);
