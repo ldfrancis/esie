@@ -3,8 +3,6 @@
 #include "llama.hpp"
 
 
-int debug = 0;
-
 LlamaForCausalLM::LlamaForCausalLM(int vocab_size, int hidden_size, int intermediate_size, int num_attention_heads, 
         int num_key_value_heads, int max_position_embeddings, float rope_theta, 
         float partial_rotary_factor, int head_dim, int num_hidden_layers, float* weight, 
