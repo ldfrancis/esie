@@ -83,8 +83,7 @@ int test_llama3_1_8b() {
     float* target_logits = new float[1*3*vocab_size];
     file2.read(reinterpret_cast<char*>(target_logits), 1*3*vocab_size*sizeof(float));
     file2.close();
-
-    debug_print(target_logits);
+    
     // compare logits to target logits
     for(int i=0; i<3*100000; i++){
         if(abs(logits[i]-target_logits[i]) > 1e-3){

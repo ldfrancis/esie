@@ -27,7 +27,6 @@ void LlamaForCausalLM::forward(float* output, const int* input, const int* posit
     float* buffer = new float[batch_size*seq_len*this->hidden_size];
     this->model.forward(buffer, input, position_ids, batch_size, seq_len);
     this->lm_head.forward(output, buffer, batch_size, seq_len);
-    debug_print(output);
     delete[] buffer;
 }
 
@@ -67,9 +66,6 @@ void LlamaModel::forward(float* output, const int* input, const int* position_id
 
     this->norm.forward(output, embeds, batch_size, seq_len);
 
-    debug_print(output);
-    debug_dash();
-
     delete[] embeds;
     delete[] buffer;
     delete[] cos;
@@ -100,10 +96,6 @@ void LlamaDecoderLayer::forward(float* output, const float* input, const float* 
     int batch_size, int seq_len) {
     float* temp_output = new float[batch_size * seq_len * hidden_size];
     float* temp_output1 = new float[batch_size * seq_len * hidden_size];
-    // if (layer_idx==1) {
-    //     debug_print(input);
-    //     debug = 1;
-    // }
 
     this->input_layernorm.forward(temp_output, input, batch_size, seq_len);
     this->self_attn.forward(output, temp_output, cos, sin, batch_size, seq_len);
@@ -116,10 +108,8 @@ void LlamaDecoderLayer::forward(float* output, const float* input, const float* 
     for(int i = 0; i < batch_size * seq_len * hidden_size; ++i) {
         output[i] += temp_output1[i]; // Residual connection
     }
-    // if(layer_idx==1) debug_print(output);
     delete[] temp_output;
     delete[] temp_output1;
-    // if(layer_idx==1) debug_dash();
 
 }
 
@@ -349,7 +339,7 @@ void LlamaRMSNorm::forward(float* output, const float* input, int batch_size, in
             }
         }
     }
-    // debug_print(weight);
+    
 }
 
 void sigmoid(float* output, const float* input, int batch_size, int seq_len) {

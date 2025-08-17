@@ -23,9 +23,6 @@ void Qwen3_4BForCausalLM::forward(float* output, const int* input, const int* po
     float* buffer = new float[batch_size*seq_len*this->hidden_size];
     this->model.forward(buffer, input, position_ids, batch_size, seq_len);
     this->lm_head.forward(output, buffer, batch_size, seq_len);
-    int h = hidden_size;
-    debug_print(output + 2*h-3);
-    debug_dash();
     delete[] buffer;
 }
 
@@ -50,9 +47,6 @@ void Qwen3_8BForCausalLM::forward(float* output, const int* input, const int* po
     float* buffer = new float[batch_size*seq_len*this->hidden_size];
     this->model.forward(buffer, input, position_ids, batch_size, seq_len);
     this->lm_head.forward(output, buffer, batch_size, seq_len);
-    int h = hidden_size;
-    debug_print(output + 2*h-3);
-    debug_dash();
     delete[] buffer;
 }
 
@@ -77,9 +71,6 @@ void Qwen3_14BForCausalLM::forward(float* output, const int* input, const int* p
     float* buffer = new float[batch_size*seq_len*this->hidden_size];
     this->model.forward(buffer, input, position_ids, batch_size, seq_len);
     this->lm_head.forward(output, buffer, batch_size, seq_len);
-    int h = hidden_size;
-    debug_print(output + 2*h-3);
-    debug_dash();
     delete[] buffer;
 }
 
@@ -120,9 +111,6 @@ void QwenModel::forward(float* output, const int* input, const int* position_ids
     }
 
     this->norm.forward(output, embeds, batch_size, seq_len);
-    int h = hidden_size;
-    debug_print(output + 2*h-3);
-    debug_dash();
     delete[] embeds;
     delete[] buffer;
     delete[] cos;
@@ -154,7 +142,6 @@ void QwenDecoderLayer::forward(float* output, const float* input, const float* c
     float* temp_output = new float[batch_size * seq_len * hidden_size];
     float* temp_output1 = new float[batch_size * seq_len * hidden_size];
     this->input_layernorm.forward(temp_output, input, batch_size, seq_len);
-    // debug_print(output + 5117);
     this->self_attn.forward(output, temp_output, cos, sin, batch_size, seq_len);
 
     for(int i = 0; i < batch_size * seq_len * hidden_size; ++i) {
