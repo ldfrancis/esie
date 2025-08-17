@@ -3,16 +3,30 @@ import torch
 import numpy as np
 import os
 from transformers import AutoTokenizer, AutoModelForCausalLM
+import argparse
 
-model = AutoModelForCausalLM.from_pretrained("microsoft/phi-4", torch_dtype='auto')
+parser = argparse.ArgumentParser(description="Generate Qwen3 weights")
+parser.add_argument("name", type=str, help="Model Name on HF") # e.g., 'Qwen/Qwen3-4B', 'microsoft/phi-4', 'meta-llama/Llama-2-7b-hf', 'meta-llama/Meta-Llama-3-8B-Instruct'
+args = parser.parse_args()
+model_name = args.name
+model_name_flattened = model_name.replace("/", "_")
+
+model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype='auto')
 
 script_dir = os.path.dirname(__file__)
 weights_dir = f"{script_dir}/../weights"
 os.makedirs(weights_dir, exist_ok=True)
 
+model.to(torch.float32)
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokens = tokenizer.encode("How far", return_tensors="pt")
+position_ids = torch.arange(3).unsqueeze(0)
+res = model(tokens)
+breakpoint()
+
 config = model.config
 # save the model weights to a .bin file
-with open(f"{weights_dir}/phi4_weights_fp32.bin", "wb") as f:
+with open(f"{weights_dir}/{model_name_flattened}_weights_fp32.bin", "wb") as f:
     # write header
     header = np.zeros(256, dtype=np.uint32)
     header[0] = 1 # id
@@ -38,14 +52,14 @@ with open(f"{weights_dir}/phi4_weights_fp32.bin", "wb") as f:
 
     for name, param in model.named_parameters():
         f.write(param.detach().to(torch.float32).numpy().tobytes())
-print(f"Model weights saved to {weights_dir}/phi4_weights_fp32.bin")
+print(f"Model weights saved to {weights_dir}/{model_name_flattened}_weights_fp32.bin")
 
 model.to(torch.float32)
-tokenizer = AutoTokenizer.from_pretrained("microsoft/phi-4")
+tokenizer = AutoTokenizer.from_pretrained(model_name)
 tokens = tokenizer.encode("How far", return_tensors="pt")
 position_ids = torch.arange(3).unsqueeze(0)
 
 res = model(tokens)
-with open(f"{weights_dir}/phi4_logits.bin", "wb") as f:
-    f.write(res.logits.detach().to(torch.float32).numpy().tobytes())
-print(f"Logits saved to {weights_dir}/phi4_logits.bin")
+with open(f"{weights_dir}/{model_name_flattened}_logits.bin", "wb") as f:
+    f.write(res.logits.detach().to(torch.float32).cpu().numpy().tobytes())
+print(f"Logits saved to {weights_dir}/{model_name_flattened}_logits.bin")

@@ -5,50 +5,6 @@
 #include "llama.hpp"
 
 
-// Qwen3ForCausalLM(
-//   (model): Qwen3Model(
-//     (embed_tokens): Embedding(151936, 2560)
-//     (layers): ModuleList(
-//       (0-35): 36 x Qwen3DecoderLayer(
-//         (self_attn): Qwen3Attention(
-//           (q_proj): Linear(in_features=2560, out_features=4096, bias=False)
-//           (k_proj): Linear(in_features=2560, out_features=1024, bias=False)
-//           (v_proj): Linear(in_features=2560, out_features=1024, bias=False)
-//           (o_proj): Linear(in_features=4096, out_features=2560, bias=False)
-//           (q_norm): Qwen3RMSNorm((128,), eps=1e-06)
-//           (k_norm): Qwen3RMSNorm((128,), eps=1e-06)
-//         )
-//         (mlp): Qwen3MLP(
-//           (gate_proj): Linear(in_features=2560, out_features=9728, bias=False)
-//           (up_proj): Linear(in_features=2560, out_features=9728, bias=False)
-//           (down_proj): Linear(in_features=9728, out_features=2560, bias=False)
-//           (act_fn): SiLU()
-//         )
-//         (input_layernorm): Qwen3RMSNorm((2560,), eps=1e-06)
-//         (post_attention_layernorm): Qwen3RMSNorm((2560,), eps=1e-06)
-//       )
-//     )
-//     (norm): Qwen3RMSNorm((2560,), eps=1e-06)
-//     (rotary_emb): Qwen3RotaryEmbedding()
-//   )
-//   (lm_head): Linear(in_features=2560, out_features=151936, bias=False)
-// )
-
-
-// model.embed_tokens.weight
-// model.layers.0.self_attn.q_proj.weight
-// model.layers.0.self_attn.k_proj.weight
-// model.layers.0.self_attn.v_proj.weight
-// model.layers.0.self_attn.o_proj.weight
-// model.layers.0.self_attn.q_norm.weight
-// model.layers.0.self_attn.k_norm.weight
-// model.layers.0.mlp.gate_proj.weight
-// model.layers.0.mlp.up_proj.weight
-// model.layers.0.mlp.down_proj.weight
-// model.layers.0.input_layernorm.weight
-// model.layers.0.post_attention_layernorm.weight
-// model.norm.weight
-
 
 class QwenRMSNorm{
 private:
@@ -410,26 +366,3 @@ public:
 
     void forward(float* output, const int* input, const int* position_ids, int batch_size, int seq_len);
 };
-
-
-// class Qwen3_4BForCausalLM : QwenForCausalLM{
-// };
-
-// class Qwen3_8BForCausalLM : public QwenForCausalLM {
-// public:
-
-//     Qwen3_8BForCausalLM(int vocab_size, int hidden_size, int intermediate_size,
-//                         int num_attention_heads, int num_key_value_heads,
-//                         int max_position_embeddings, float rope_theta,
-//                         float partial_rotary_factor, int head_dim, int num_hidden_layers,
-//                         float* weight, float rms_norm_eps)
-//         : QwenForCausalLM(vocab_size, hidden_size, intermediate_size,
-//                           num_attention_heads, num_key_value_heads,
-//                           max_position_embeddings, rope_theta, partial_rotary_factor,
-//                           head_dim, num_hidden_layers, weight, rms_norm_eps) {}
-// };
-
-// class Qwen3_14BForCausalLM : Qwen3_8BForCausalLM{
-// };
-
-

@@ -7,16 +7,16 @@
 
 
 int main(){
-    // std::cout << "Llama Test 2---" << std::endl;
+    // std::cout << "Llama2 Test ---" << std::endl;
     // int llama_test = test_llama();
 
-    std::cout << "Llama Test 3---" << std::endl;
-    int llama_test3 = test_llama3_1_8b();
+    // std::cout << "Llama3 Test ---" << std::endl;
+    // int llama_test3 = test_llama3_1_8b();
 
-    // std::cout << "Phi Test---" << std::endl;
-    // int phi4_test = test_phi4();
+    std::cout << "Phi4 Test---" << std::endl;
+    int phi4_test = test_phi4();
 
-    // std::cout << "Qwen Test---" << std::endl;
+    // std::cout << "Qwen3 4B Test---" << std::endl;
     // int qwen3_test = test_qwen3_4b();
 
     // std::cout << "Qwen3 8B Test --" << std::endl;

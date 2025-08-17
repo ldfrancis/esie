@@ -4,24 +4,6 @@
 #include "llama.hpp"
 
 
-// weights:
-// model.embed_tokens.weight
-// model.layers.0.self_attn.o_proj.weight
-// model.layers.0.self_attn.qkv_proj.weight
-// model.layers.0.mlp.gate_up_proj.weight
-// model.layers.0.mlp.down_proj.weight
-// model.layers.0.input_layernorm.weight
-// model.layers.0.post_attention_layernorm.weight
-// model.layers.1.self_attn.o_proj.weight
-// model.layers.1.self_attn.qkv_proj.weight
-// model.layers.1.mlp.gate_up_proj.weight
-// model.layers.1.mlp.down_proj.weight
-// model.layers.1.input_layernorm.weight
-// model.layers.1.post_attention_layernorm.weight
-// model.norm.weight
-// lm_head.weight
-
-
 class PhiRotaryEmbedding{
 private:
     int max_seq_len_cached;
