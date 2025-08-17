@@ -1,11 +1,12 @@
+#pragma once
 #include <iostream>
 #include <fstream>
 #include <vector>
 #include <chrono>
-#include "esie/models/llama.hpp"
+#include "esie/models/phi.hpp"
 
 
-int test_llama2_7b() {
+int test_phi4() {
     // config ints
     int vocab_size; 
     int hidden_size;
@@ -21,11 +22,12 @@ int test_llama2_7b() {
     float rope_theta;
     float partial_rotary_factor;
 
-    std::ifstream file("../weights/llama2_7b_weights_fp32.bin", std::ios::in|std::ios::binary);
+    std::ifstream file("../weights/microsoft_phi-4_weights_fp32.bin", std::ios::in|std::ios::binary);
     if(!file.is_open()){
         std::cerr << "Error opening file!" << std::endl;
         return -1;
     }
+    std::cout<<"Loading weights from file ../weights/microsoft_phi-4_weights_fp32.bin" << std::endl;
 
     size_t bytes_to_read = 256*4;
     char* buffer = new char[bytes_to_read];
@@ -46,7 +48,7 @@ int test_llama2_7b() {
     partial_rotary_factor = *(reinterpret_cast<float*>(&header[12]));
 
     size_t num_parameters = 0;
-    LlamaForCausalLM l(
+    PhiForCausalLM l(
         vocab_size, hidden_size, intermediate_size, num_attention_heads,
         num_key_value_heads, max_position_embeddings, rope_theta,
         partial_rotary_factor, head_dim, num_hidden_layers, nullptr, rms_norm_eps
@@ -57,46 +59,56 @@ int test_llama2_7b() {
     char* buffer2 = new char[num_bytes];
     file.read(buffer2, num_bytes);
 
-
+    std::cout << "Number of parameters: " << num_parameters << std::endl;
+    std::cout << "Assigning model parameters" << std::endl;
     float* weight = reinterpret_cast<float*>(buffer2);
     l.set_weight(weight);
     file.close();
 
-    int tokens[1][3] = {{1, 1128, 2215}};
-    int position_ids[1][3] = {{0, 1, 2}};
-    float* logits = new float[1*3*vocab_size];
+    std::cout << "Forward pass through the model " << std::endl;
+    int b=1, s=2;
+    int tokens[b][s] = {{4438, 3117}};
+    int position_ids[b][s] = {{0, 1}};
+    float* logits = new float[b*s*vocab_size];
 
     // calculate the time for one forward pass
     auto start = std::chrono::high_resolution_clock::now();
-    l.forward(logits, (const int*)tokens, (const int*)position_ids, 1, 3);
+    l.forward(logits, (const int*)tokens, (const int*)position_ids, b, s);
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end - start;
     std::cout << "Time for one forward pass: " << elapsed.count() << " seconds" << std::endl;
 
     // load logits
-    std::ifstream file2("../weights/llama2_7b_logits.bin", std::ios::in|std::ios::binary);
+    std::cout << "Loading target logits from file ../weights/microsoft_phi-4_logits.bin" << std::endl;
+    std::ifstream file2("../weights/microsoft_phi-4_logits.bin", std::ios::in|std::ios::binary);
     if(!file2.is_open()){
         std::cerr << "Error opening file!" << std::endl;
         return -1;
     }
-    float* target_logits = new float[1*3*vocab_size];
-    file2.read(reinterpret_cast<char*>(target_logits), 1*3*vocab_size*sizeof(float));
+    float* target_logits = new float[b*s*vocab_size];
+    file2.read(reinterpret_cast<char*>(target_logits), b*s*vocab_size*sizeof(float));
     file2.close();
 
     // compare logits to target logits
-    for(int i=0; i<3*vocab_size; i++){
+    std::cout << "Checking computed logits and target logits for mismatch" << std::endl;
+    bool failed_test = false;
+    for(int i=0; i<b*s*vocab_size; i++){
         if(abs(logits[i]-target_logits[i]) > 1e-3){
             std::cout << "Logits mismatch at index " << i << ": "
                       << logits[i] << " != " << target_logits[i] << std::endl;
+            failed_test = true;
         }
     }
 
-    std::cout << "Test Completed Successfully" << std::endl;
+    if (failed_test) {
+        std::cout << "Test Failed" << std::endl;
+    } else {
+        std::cout << "Test Completed Successfully" << std::endl;
+    }
 
     delete[] buffer;
     delete[] buffer2;
     delete[] logits;
     delete[] target_logits;
-    file2.close();
     return 0;
 }

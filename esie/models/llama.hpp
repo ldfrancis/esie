@@ -1,14 +1,16 @@
+#pragma once
 #include <iostream>
 #include <vector>
+#include "utils.hpp"
 
 
 class EmbedTokens{
-private:
+public:
     float* weight;
     int vocab_size;
     int hidden_size;
 
-public:
+// public:
     EmbedTokens(): vocab_size(0), hidden_size(0), weight(nullptr) {}
     EmbedTokens(int vocab_size, int hidden_size, float* weight);
     ~EmbedTokens();
@@ -27,13 +29,13 @@ public:
 
 
 class Linear{
-private:
+public:
     int input_dim;
     int output_dim;
     float* weight;
     float* bias;
 
-public:
+// public:
     Linear(): input_dim(0), output_dim(0), weight(nullptr), bias(nullptr) {}
     Linear(int in_features, int out_features, float* weight, float* bias);
     ~Linear();
@@ -57,12 +59,12 @@ public:
 
 
 class LlamaRMSNorm{
-private:
+public:
     float* weight;
     float variance_epsilon;
     int hidden_size;
 
-public:
+// public:
     LlamaRMSNorm(): weight(nullptr), variance_epsilon(1e-6), hidden_size(0) {}
     LlamaRMSNorm(float* weight, float variance_epsilon, int hidden_size );
     ~LlamaRMSNorm();
@@ -80,7 +82,7 @@ public:
 
 
 class LlamaRotaryEmbedding{
-private:
+public:
     int max_seq_len_cached;
     int original_max_seq_len;
     float rope_theta;
@@ -90,7 +92,7 @@ private:
     float* inv_freqs;
     float* original_inv_freq;
 
-public:
+// public:
     LlamaRotaryEmbedding(): max_seq_len_cached(0), original_max_seq_len(0), 
         rope_theta(0.0f), partial_rotary_factor(0.0f), head_dim(0), 
         attention_scaling(1.0f), inv_freqs(nullptr), original_inv_freq(nullptr) {}
@@ -105,9 +107,10 @@ public:
 
 
 class LlamaAttention{
-private:
+public:
     int hidden_dim;
     int num_attention_heads;
+    int num_key_value_heads;
     int head_dim;
     int hidden_size;
     int layer_index;
@@ -119,10 +122,10 @@ private:
     Linear v_proj;
     Linear o_proj;
 
-public:
-    LlamaAttention(): hidden_dim(0), num_attention_heads(0), head_dim(0), hidden_size(0), layer_index(0), num_key_value_groups(0), scaling(1.0f) {}
+// public:
+    LlamaAttention(): hidden_dim(0), num_attention_heads(0), num_key_value_heads(0), head_dim(0), hidden_size(0), layer_index(0), num_key_value_groups(0), scaling(1.0f) {}
     LlamaAttention(int hidden_size, int num_attention_heads, int layer_index, 
-        int num_key_value_heads, float* weight);
+        int num_key_value_heads, int head_dim, float* weight);
     ~LlamaAttention();
 
     void forward(float* output, const float* input, const float* cos, const float* sin, 
@@ -130,15 +133,16 @@ public:
     void set_weight(float* new_weight) {
         float* weight_ptr = new_weight;
         this->q_proj.set_weight(weight_ptr);
-        weight_ptr += (static_cast<size_t>(hidden_size) * static_cast<size_t>(hidden_size));
+        weight_ptr += q_proj.get_weight_size();
         this->k_proj.set_weight(weight_ptr);
-        weight_ptr += (static_cast<size_t>(hidden_size) * static_cast<size_t>(hidden_size));
+        weight_ptr += k_proj.get_weight_size();
         this->v_proj.set_weight(weight_ptr);
-        weight_ptr += (static_cast<size_t>(hidden_size) * static_cast<size_t>(hidden_size));
+        weight_ptr += v_proj.get_weight_size();
         this->o_proj.set_weight(weight_ptr);
+        weight_ptr += o_proj.get_weight_size();
     }
 
-    size_t get_weight_size(){
+    size_t get_weight_size() const{
         size_t size = 0;
         size += q_proj.get_weight_size();
         size += k_proj.get_weight_size();
@@ -187,7 +191,7 @@ public:
 
 
 class LlamaMLP{
-private:
+public:
     int hidden_size;
     int intermediate_size;
 
@@ -196,7 +200,7 @@ private:
     Linear down_proj;
     SiLU act_fn;
 
-public:
+// public:
     LlamaMLP(): hidden_size(0), intermediate_size(0), gate_proj(), up_proj(), down_proj(), act_fn() {}
     LlamaMLP(int hidden_size, int intermediate_size, float* weight);
     ~LlamaMLP();
@@ -223,8 +227,9 @@ void sigmoid(float* output, const float* input, int batch_size, int seq_len);
 
 
 class LlamaDecoderLayer{
-private:
+public:
     int hidden_size;
+    int head_dim;
     int intermediate_size;
     int layer_idx;
     int num_attention_heads;
@@ -239,9 +244,9 @@ private:
     LlamaRMSNorm input_layernorm;
     LlamaRMSNorm post_attention_layernorm;
 
-public:
-    LlamaDecoderLayer(): hidden_size(0), intermediate_size(0), layer_idx(0), num_attention_heads(0), num_key_value_heads(0), rms_norm_eps(0.0f), self_attn_weight(nullptr), mlp_weight(nullptr), self_attn(), mlp(), input_layernorm(), post_attention_layernorm() {}
-    LlamaDecoderLayer(int hidden_size, int intermediate_size, int num_attention_heads, int layer_index, int num_key_value_heads, float* weight, float rms_norm_eps);
+// public:
+    LlamaDecoderLayer(): hidden_size(0), head_dim(0), intermediate_size(0), layer_idx(0), num_attention_heads(0), num_key_value_heads(0), rms_norm_eps(0.0f), self_attn_weight(nullptr), mlp_weight(nullptr), self_attn(), mlp(), input_layernorm(), post_attention_layernorm() {}
+    LlamaDecoderLayer(int hidden_size, int head_dim, int intermediate_size, int num_attention_heads, int layer_index, int num_key_value_heads, float* weight, float rms_norm_eps);
     ~LlamaDecoderLayer();
 
 
@@ -261,19 +266,17 @@ public:
 
     size_t get_weight_size() const{
         size_t size = 0;
-        size_t hs = static_cast<size_t>(hidden_size);
-        size_t is = static_cast<size_t>(intermediate_size);
-        size += hs;
-        size += 4ull * hs * hs;
-        size += 3ull * hs * is;
-        size += hs;
+        size += self_attn.get_weight_size();
+        size += mlp.get_weight_size();
+        size += input_layernorm.get_weight_size();
+        size += post_attention_layernorm.get_weight_size();
         return size;
     }
 
 };
 
 class LlamaModel{
-private:
+public:
     int vocab_size;
     int num_hidden_layers;
     int hidden_size;
@@ -285,7 +288,7 @@ private:
     LlamaRMSNorm norm;
     LlamaRotaryEmbedding rotary_embedding;
 
-public:
+// public:
     LlamaModel(): vocab_size(0), num_hidden_layers(0), hidden_size(0), intermediate_size(0), head_dim(0), embed_tokens(), layers(), norm(), rotary_embedding() {}
     LlamaModel(int vocab_size, int hidden_size, int intermediate_size, int num_attention_heads, 
         int num_key_value_heads, int max_position_embeddings, float rope_theta, 
@@ -300,10 +303,7 @@ public:
         weight_itr += static_cast<size_t>(vocab_size) * static_cast<size_t>(hidden_size);
         for(auto& layer : layers) {
             layer.set_weight(weight_itr);
-            weight_itr += hidden_size; // input layer norm
-            weight_itr += 4ull * static_cast<size_t>(hidden_size) * static_cast<size_t>(hidden_size); // attention
-            weight_itr += 3ull * static_cast<size_t>(hidden_size) * static_cast<size_t>(intermediate_size); // MLP
-            weight_itr += hidden_size; // post attention layer norm
+            weight_itr += layer.get_weight_size();
         }
         this->norm.set_weight(weight_itr); // Set the weight for the final layer norm
     }
@@ -322,12 +322,12 @@ public:
 
 // Llama model
 class LlamaForCausalLM{
-private:
+public:
     int hidden_size;
 
     Linear lm_head;
     LlamaModel model;
-public:
+// public:
     LlamaForCausalLM(): hidden_size(0), lm_head(), model() {}
     LlamaForCausalLM(int vocab_size, int hidden_size, int intermediate_size, int num_attention_heads, 
         int num_key_value_heads, int max_position_embeddings, float rope_theta, 

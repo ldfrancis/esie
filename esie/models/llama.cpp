@@ -3,6 +3,8 @@
 #include "llama.hpp"
 
 
+int debug = 0;
+
 LlamaForCausalLM::LlamaForCausalLM(int vocab_size, int hidden_size, int intermediate_size, int num_attention_heads, 
         int num_key_value_heads, int max_position_embeddings, float rope_theta, 
         float partial_rotary_factor, int head_dim, int num_hidden_layers, float* weight, 
@@ -25,6 +27,7 @@ void LlamaForCausalLM::forward(float* output, const int* input, const int* posit
     float* buffer = new float[batch_size*seq_len*this->hidden_size];
     this->model.forward(buffer, input, position_ids, batch_size, seq_len);
     this->lm_head.forward(output, buffer, batch_size, seq_len);
+    debug_print(output);
     delete[] buffer;
 }
 
@@ -41,7 +44,7 @@ LlamaModel::LlamaModel(int vocab_size, int hidden_size, int intermediate_size, i
     rotary_embedding(hidden_size, max_position_embeddings, rope_theta, partial_rotary_factor, head_dim)
 {
     for (int i = 0; i < num_hidden_layers; ++i) {
-        layers.emplace_back(hidden_size, intermediate_size, num_attention_heads, i, num_key_value_heads, nullptr, rms_norm_eps);
+        layers.emplace_back(hidden_size, head_dim, intermediate_size, num_attention_heads, i, num_key_value_heads, nullptr, rms_norm_eps);
     }
     this->set_weight(weight);
 }
@@ -64,13 +67,16 @@ void LlamaModel::forward(float* output, const int* input, const int* position_id
 
     this->norm.forward(output, embeds, batch_size, seq_len);
 
+    debug_print(output);
+    debug_dash();
+
     delete[] embeds;
     delete[] buffer;
     delete[] cos;
     delete[] sin;
 }
 
-LlamaDecoderLayer::LlamaDecoderLayer(int hidden_size, int intermediate_size, int num_attention_heads, int layer_index, int num_key_value_heads, float* weight, float rms_norm_eps):
+LlamaDecoderLayer::LlamaDecoderLayer(int hidden_size, int head_dim, int intermediate_size, int num_attention_heads, int layer_index, int num_key_value_heads, float* weight, float rms_norm_eps):
     hidden_size(hidden_size),
     intermediate_size(intermediate_size), 
     layer_idx(layer_index),
@@ -80,7 +86,7 @@ LlamaDecoderLayer::LlamaDecoderLayer(int hidden_size, int intermediate_size, int
     num_key_value_heads(num_key_value_heads), 
     rms_norm_eps(rms_norm_eps),  
     // object initializer
-    self_attn(hidden_size, num_attention_heads, layer_index, num_key_value_heads, weight),
+    self_attn(hidden_size, num_attention_heads, layer_index, num_key_value_heads, head_dim, weight),
     mlp(hidden_size, intermediate_size, mlp_weight),
     input_layernorm(weight, rms_norm_eps, hidden_size),
     post_attention_layernorm(weight, rms_norm_eps, hidden_size) {
@@ -94,23 +100,26 @@ void LlamaDecoderLayer::forward(float* output, const float* input, const float* 
     int batch_size, int seq_len) {
     float* temp_output = new float[batch_size * seq_len * hidden_size];
     float* temp_output1 = new float[batch_size * seq_len * hidden_size];
+    // if (layer_idx==1) {
+    //     debug_print(input);
+    //     debug = 1;
+    // }
 
     this->input_layernorm.forward(temp_output, input, batch_size, seq_len);
     this->self_attn.forward(output, temp_output, cos, sin, batch_size, seq_len);
-
     for(int i = 0; i < batch_size * seq_len * hidden_size; ++i) {
         output[i] += input[i]; // Residual connection
     }
-
     this->post_attention_layernorm.forward(temp_output, output, batch_size, seq_len);
     this->mlp.forward(temp_output1, temp_output, batch_size, seq_len);
 
     for(int i = 0; i < batch_size * seq_len * hidden_size; ++i) {
         output[i] += temp_output1[i]; // Residual connection
     }
-
+    // if(layer_idx==1) debug_print(output);
     delete[] temp_output;
     delete[] temp_output1;
+    // if(layer_idx==1) debug_dash();
 
 }
 
@@ -164,20 +173,20 @@ void Linear::forward(float* output, const float* input, int batch_size, int seq_
 }
 
 LlamaAttention::LlamaAttention(int hidden_size, int num_attention_heads, int layer_index, 
-    int num_key_value_heads, float* weight)
+    int num_key_value_heads, int head_dim, float* weight)
     : 
     hidden_dim(hidden_size), 
     num_attention_heads(num_attention_heads), 
     hidden_size(hidden_size), 
     layer_index(layer_index), 
-    num_key_value_groups(num_key_value_heads),
-    head_dim(hidden_size / num_attention_heads),
+    num_key_value_heads(num_key_value_heads),
+    head_dim(head_dim),
     scaling(1.0f),
     // object initializers
-    q_proj(hidden_size, hidden_size, weight, nullptr),
-    k_proj(hidden_size, hidden_size, weight + hidden_size * hidden_size, nullptr),
-    v_proj(hidden_size, hidden_size, weight + 2 * hidden_size * hidden_size, nullptr),
-    o_proj(hidden_size, hidden_size, weight + 3 * hidden_size * hidden_size, nullptr) {
+    q_proj(hidden_size, num_attention_heads*head_dim, nullptr, nullptr),
+    k_proj(hidden_size, num_key_value_heads*head_dim, nullptr, nullptr),
+    v_proj(hidden_size, num_key_value_heads*head_dim, nullptr, nullptr),
+    o_proj(num_attention_heads*head_dim, hidden_size, nullptr, nullptr) {
 
     this->scaling = std::pow(this->head_dim, -0.5f);
     this->num_key_value_groups = this->num_attention_heads / num_key_value_heads;
@@ -188,12 +197,12 @@ LlamaAttention::~LlamaAttention() {
 
 void LlamaAttention::forward(float* output, const float* input, const float* cos, const float* sin, 
     int batch_size, int seq_len) {
-    float* q__ = new float[batch_size * seq_len * this->hidden_size];
-    float* k__ = new float[batch_size * seq_len * this->hidden_size];
-    float* v_ = new float[batch_size * seq_len * this->hidden_size];
+    float* q__ = new float[batch_size * seq_len * num_attention_heads*hidden_dim];
+    float* k__ = new float[batch_size * seq_len * num_key_value_heads*hidden_dim];
+    float* v_ = new float[batch_size * seq_len * num_key_value_heads*hidden_dim];
 
-    float* q_ = new float[batch_size*seq_len*this->hidden_size];
-    float* k_ = new float[batch_size*seq_len*this->hidden_size];
+    float* q_ = new float[batch_size*seq_len*num_attention_heads*hidden_dim];
+    float* k_ = new float[batch_size*seq_len*num_key_value_heads*hidden_dim];
 
     float* attn_scores_ = new float[batch_size * seq_len * seq_len * this->num_attention_heads];
     for(size_t i=0; i<batch_size*seq_len*seq_len*num_attention_heads; ++i) attn_scores_[i] = 0.0f;
@@ -210,6 +219,7 @@ void LlamaAttention::forward(float* output, const float* input, const float* cos
     }
     
     // Compute attention scores and apply softmax
+    float kv_group_scale = 1.0f/static_cast<float>(num_key_value_groups);
     for (int i = 0; i < batch_size; ++i) {
         for (int j = 0; j < seq_len; ++j) {
             for(int h=0; h<num_attention_heads; ++h) {
@@ -219,7 +229,7 @@ void LlamaAttention::forward(float* output, const float* input, const float* cos
 
                 // obtain dot prod
                 for(int k=0; k<j+1; ++k){
-                    float* key = k_ + i*seq_len*num_attention_heads*head_dim + k*num_attention_heads*head_dim + h*head_dim;
+                    float* key = k_ + i*seq_len*num_attention_heads*head_dim + k*num_attention_heads*head_dim + static_cast<int>(h*kv_group_scale)*head_dim;
                     float score = 0;
                     for(int d=0; d<head_dim; ++d){
                         score += query[d] * key[d];
@@ -246,7 +256,7 @@ void LlamaAttention::forward(float* output, const float* input, const float* cos
                 // compute attention output
                 float* o = buffer + i*seq_len*num_attention_heads*head_dim + j*num_attention_heads*head_dim + h*head_dim;
                 for(int k=0; k<j+1; ++k){
-                    float* v = v_ + i*seq_len*num_attention_heads*head_dim + k*num_attention_heads*head_dim + h*head_dim;
+                    float* v = v_ + i*seq_len*num_attention_heads*head_dim + k*num_attention_heads*head_dim + static_cast<int>(h*kv_group_scale)*head_dim;
                     for(int d=0; d<head_dim; ++d){
                         o[d] += a[k] * v[d];
                     }
@@ -339,6 +349,7 @@ void LlamaRMSNorm::forward(float* output, const float* input, int batch_size, in
             }
         }
     }
+    // debug_print(weight);
 }
 
 void sigmoid(float* output, const float* input, int batch_size, int seq_len) {
