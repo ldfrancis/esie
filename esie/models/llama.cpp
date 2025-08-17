@@ -197,12 +197,12 @@ LlamaAttention::~LlamaAttention() {
 
 void LlamaAttention::forward(float* output, const float* input, const float* cos, const float* sin, 
     int batch_size, int seq_len) {
-    float* q__ = new float[batch_size * seq_len * num_attention_heads*hidden_dim];
-    float* k__ = new float[batch_size * seq_len * num_key_value_heads*hidden_dim];
-    float* v_ = new float[batch_size * seq_len * num_key_value_heads*hidden_dim];
+    float* q__ = new float[batch_size * seq_len * num_attention_heads*head_dim];
+    float* k__ = new float[batch_size * seq_len * num_key_value_heads*head_dim];
+    float* v_ = new float[batch_size * seq_len * num_key_value_heads*head_dim];
 
-    float* q_ = new float[batch_size*seq_len*num_attention_heads*hidden_dim];
-    float* k_ = new float[batch_size*seq_len*num_key_value_heads*hidden_dim];
+    float* q_ = new float[batch_size*seq_len*num_attention_heads*head_dim];
+    float* k_ = new float[batch_size*seq_len*num_key_value_heads*head_dim];
 
     float* attn_scores_ = new float[batch_size * seq_len * seq_len * this->num_attention_heads];
     for(size_t i=0; i<batch_size*seq_len*seq_len*num_attention_heads; ++i) attn_scores_[i] = 0.0f;
@@ -211,7 +211,7 @@ void LlamaAttention::forward(float* output, const float* input, const float* cos
     this->k_proj.forward(k__, input, batch_size, seq_len);
     this->v_proj.forward(v_, input, batch_size, seq_len);
 
-    LlamaAttention::apply_rotary_pos_embedding(q_, k_, q__, k__, cos, sin, batch_size, seq_len, num_attention_heads, head_dim);
+    LlamaAttention::apply_rotary_pos_embedding(q_, k_, q__, k__, cos, sin, batch_size, seq_len, num_attention_heads, num_key_value_heads, head_dim);
     
     float* buffer = new float[batch_size*seq_len*num_attention_heads*head_dim];
     for(size_t i=0; i<batch_size*seq_len*num_attention_heads*head_dim; ++i) {
@@ -229,7 +229,7 @@ void LlamaAttention::forward(float* output, const float* input, const float* cos
 
                 // obtain dot prod
                 for(int k=0; k<j+1; ++k){
-                    float* key = k_ + i*seq_len*num_attention_heads*head_dim + k*num_attention_heads*head_dim + static_cast<int>(h*kv_group_scale)*head_dim;
+                    float* key = k_ + i*seq_len*num_key_value_heads*head_dim + k*num_key_value_heads*head_dim + static_cast<int>(h*kv_group_scale)*head_dim;
                     float score = 0;
                     for(int d=0; d<head_dim; ++d){
                         score += query[d] * key[d];
@@ -256,7 +256,7 @@ void LlamaAttention::forward(float* output, const float* input, const float* cos
                 // compute attention output
                 float* o = buffer + i*seq_len*num_attention_heads*head_dim + j*num_attention_heads*head_dim + h*head_dim;
                 for(int k=0; k<j+1; ++k){
-                    float* v = v_ + i*seq_len*num_attention_heads*head_dim + k*num_attention_heads*head_dim + static_cast<int>(h*kv_group_scale)*head_dim;
+                    float* v = v_ + i*seq_len*num_key_value_heads*head_dim + k*num_key_value_heads*head_dim + static_cast<int>(h*kv_group_scale)*head_dim;
                     for(int d=0; d<head_dim; ++d){
                         o[d] += a[k] * v[d];
                     }

@@ -153,25 +153,30 @@ public:
 
     static void apply_rotary_pos_embedding(float* q_output, float* k_output, const float* q,
          const float* k, const float* cos, const float* sin, 
-        int batch_size, int seq_len, int num_attention_heads, int head_dim) {
+        int batch_size, int seq_len, int num_attention_heads, int num_key_value_heads, int head_dim) {
         for (int i = 0; i < batch_size; ++i) {
             for (int j = 0; j < seq_len; ++j) {
                 const float* cos_seek = cos + j*head_dim;
                 const float* sin_seek = sin + j*head_dim;
                 for (int h = 0; h < num_attention_heads; ++h) {
-                    float *q_output_seek = q_output + i*seq_len*num_attention_heads*head_dim+
-                        j*num_attention_heads*head_dim+h*head_dim;
-                    float *k_output_seek = k_output + i*seq_len*num_attention_heads*head_dim+
-                        j*num_attention_heads*head_dim+h*head_dim;
-                    const float* q_seek = q + i*seq_len*num_attention_heads*head_dim+
-                        j*num_attention_heads*head_dim+h*head_dim;
-                    const float* k_seek = k + i*seq_len*num_attention_heads*head_dim+
-                        j*num_attention_heads*head_dim+h*head_dim;
+                    float *q_output_seek = q_output + i*seq_len*num_attention_heads*head_dim+j*num_attention_heads*head_dim+h*head_dim;
+                    const float* q_seek = q + i*seq_len*num_attention_heads*head_dim+j*num_attention_heads*head_dim+h*head_dim;
                     int half_dim = head_dim/2;
                     for (int d = 0; d < head_dim; ++d) {
                         int ind_rot = (d + half_dim) % head_dim;
                         float sgn_rot = (d < half_dim) ? -1.0f : 1.0f;
                         q_output_seek[d] = q_seek[d] * cos_seek[d] + sgn_rot * q_seek[ind_rot] * sin_seek[d];
+                        
+                    }
+                }
+
+                for (int h = 0; h < num_key_value_heads; ++h) {
+                    float *k_output_seek = k_output + i*seq_len*num_key_value_heads*head_dim+j*num_key_value_heads*head_dim+h*head_dim;
+                    const float* k_seek = k + i*seq_len*num_key_value_heads*head_dim+j*num_key_value_heads*head_dim+h*head_dim;
+                    int half_dim = head_dim/2;
+                    for (int d = 0; d < head_dim; ++d) {
+                        int ind_rot = (d + half_dim) % head_dim;
+                        float sgn_rot = (d < half_dim) ? -1.0f : 1.0f;
                         k_output_seek[d] = k_seek[d] * cos_seek[d] + sgn_rot * k_seek[ind_rot] * sin_seek[d];
                     }
                 }
