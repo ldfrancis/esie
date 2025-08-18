@@ -17,12 +17,12 @@ script_dir = os.path.dirname(__file__)
 weights_dir = f"{script_dir}/../weights"
 os.makedirs(weights_dir, exist_ok=True)
 
-model.to(torch.float32)
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-tokens = tokenizer.encode("How far", return_tensors="pt")
-position_ids = torch.arange(3).unsqueeze(0)
-res = model(tokens)
-breakpoint()
+# model.to(torch.float32)
+# tokenizer = AutoTokenizer.from_pretrained(model_name)
+# tokens = tokenizer.encode("How far", return_tensors="pt")
+# position_ids = torch.arange(3).unsqueeze(0)
+# res = model(tokens)
+# breakpoint()
 
 config = model.config
 # save the model weights to a .bin file
