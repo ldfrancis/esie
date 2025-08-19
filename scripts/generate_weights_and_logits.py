@@ -5,7 +5,7 @@ import os
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import argparse
 
-parser = argparse.ArgumentParser(description="Generate Qwen3 weights")
+parser = argparse.ArgumentParser(description="Generate model weights")
 parser.add_argument("name", type=str, help="Model Name on HF") # e.g., 'Qwen/Qwen3-4B', 'microsoft/phi-4', 'meta-llama/Llama-2-7b-hf', 'meta-llama/Meta-Llama-3-8B-Instruct'
 args = parser.parse_args()
 model_name = args.name

@@ -58,7 +58,6 @@ int test_llama() {
     char* buffer2 = new char[num_bytes];
     file.read(buffer2, num_bytes);
 
-
     float* weight = reinterpret_cast<float*>(buffer2);
     l.set_weight(weight);
     file.close();
