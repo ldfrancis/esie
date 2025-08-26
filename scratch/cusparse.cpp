@@ -113,6 +113,7 @@ int main() {
     std::vector<__half> h_A = readBinaryFile<__half>("A_values.bin", nnzA);
     std::vector<int> h_A_colInd = readBinaryFile<int>("A_col_indices.bin", nnzA);
     std::vector<__half> h_B = readBinaryFile<__half>("B.bin", K * N);
+    std::vector<__half> target_C = readBinaryFile<__half>("C.bin", M * N);
     std::vector<__half> h_C(M * N);
 
     // Allocate device memory
@@ -134,7 +135,7 @@ int main() {
     cusparseHandle_t handle; CUSPARSE_CHECK(cusparseCreate(&handle));
 
     // Timing with CUDA events
-    const int iters = 50;
+    const int iters = 500;
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
@@ -142,12 +143,11 @@ int main() {
     CUDA_CHECK(cudaEventRecord(start));
     for (int i = 0; i < iters; ++i) {
         sparseMatmulWithCusparse(handle, d_A, d_A_rowPtr, d_A_colInd, d_B, d_C, M, N, K, nnzA);
+         // Copy result back to host once (after timing to exclude memcpy)
+        CUDA_CHECK(cudaMemcpy(h_C.data(), d_C, M * N * sizeof(__half), cudaMemcpyDeviceToHost));
     }
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
-
-    // Copy result back to host once (after timing to exclude memcpy)
-    CUDA_CHECK(cudaMemcpy(h_C.data(), d_C, M * N * sizeof(__half), cudaMemcpyDeviceToHost));
 
     // Display first 10 values in C
     std::cout << "C: ";
@@ -170,6 +170,15 @@ int main() {
 
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
+
+    // Check for correctness
+    for (int i = 0; i < M*N; i++) {
+        if (fabsf(__half2float(h_C[i]) - __half2float(target_C[i])) > 1e-1) {
+            std::cerr << "Mismatch at index " << i << ": "
+                      << __half2float(h_C[i]) << " != " << __half2float(target_C[i]) << std::endl;
+            // return 1;
+        }
+    }
 
     // Clean up
     CUDA_CHECK(cudaFree(d_A));

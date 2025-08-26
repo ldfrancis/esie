@@ -125,7 +125,7 @@ int main() {
     // Read matrices A, B, and C from binary files
     std::vector<__half> h_A = readBinaryFile("A.bin", M * K);
     std::vector<__half> h_B = readBinaryFile("B.bin", K * N);
-    std::vector<__half> h_C_target = readBinaryFile("C.bin", M * N);
+    std::vector<__half> target_C = readBinaryFile("C.bin", M * N);
     std::vector<__half> h_C(M * N);
 
     // Allocate device memory
@@ -143,7 +143,7 @@ int main() {
     CUBLASLT_CHECK(cublasLtCreate(&ltHandle));
 
     // Timing with CUDA events
-    const int iters = 50;
+    const int iters = 500;
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
@@ -180,6 +180,15 @@ int main() {
 
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
+
+    // Check for correctness
+    for (int i = 0; i < M*N; i++) {
+        if (fabsf(__half2float(h_C[i]) - __half2float(target_C[i])) > 1e-3) {
+            std::cerr << "Mismatch at index " << i << ": "
+                      << __half2float(h_C[i]) << " != " << __half2float(target_C[i]) << std::endl;
+            // return 1;
+        }
+    }
 
     // Clean up
     CUDA_CHECK(cudaFree(d_A));

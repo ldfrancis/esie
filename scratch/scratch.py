@@ -14,7 +14,7 @@ N = 4096
 A = np.random.randn(M, K)
 B = np.random.randn(K, N)
 # make A 70% sparse, rowwise
-half = int(A.shape[1] * 0.7)
+half = int(A.shape[1] * 0.9)
 A = torch.tensor(A, dtype=torch.float16).to('cuda')
 B = torch.tensor(B, dtype=torch.float16).to("cuda")
 sort_res = torch.sort(A, dim=-1, stable=True)
@@ -45,4 +45,4 @@ C.detach().cpu().numpy().tofile(f'{cur_dir}/C.bin')
 
 
 print(C.detach().cpu().numpy().ravel().tolist()[:10])
-breakpoint()
+# breakpoint()
