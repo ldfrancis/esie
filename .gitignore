@@ -4,3 +4,7 @@
 build/
 a.out
 weights/
+
+# ignore all .bin and .out files
+*.bin
+*.out
