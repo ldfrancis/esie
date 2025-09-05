@@ -8,3 +8,6 @@ weights/
 # ignore all .bin and .out files
 *.bin
 *.out
+
+# ignore ipynb_checkpoints
+.ipynb_checkpoints
