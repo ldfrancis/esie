@@ -111,7 +111,7 @@ class WrappedGPT:
     This class wraps a GPT layer for specific operations.
     """
 
-    def __init__(self, layer, layer_id=0, layer_name="none"):
+    def __init__(self, layer, theta1=0.42, theta2=0.51, theta3=0.38, layer_name="none"):
         self.layer = layer
         self.dev = self.layer.weight.device
         self.rows = layer.weight.data.shape[0]
@@ -120,9 +120,17 @@ class WrappedGPT:
         self.scaler_row = torch.zeros((self.columns), device=self.dev)
         self.nsamples = 0
 
-        self.layer_id = layer_id 
         self.layer_name = layer_name
-        self.out = None
+
+        self.theta1 = theta1
+        self.theta2 = theta2
+        self.theta3 = theta3
+
+        w = (self.layer.weight.data.clone().float()).abs()
+        ws = w**2
+        wrow = 1/ws.sum(dim=0, keepdims=True).sqrt()
+        wcol = 1/ws.sum(dim=1, keepdims=True).sqrt()
+        self.weight_imp = 0.5*w * (wrow**(self.theta1) + wcol**(self.theta2))
 
     def add_batch(self, inp, out):
         if len(inp.shape) == 2:
@@ -132,13 +140,29 @@ class WrappedGPT:
             if len(inp.shape) == 3:
                 inp = inp.reshape((-1, inp.shape[-1]))
             inp = inp.t()
-
+        
         self.scaler_row *= self.nsamples / (self.nsamples+tmp)
         self.nsamples += tmp
 
         inp = inp.type(torch.float32)
         self.scaler_row += torch.norm(inp, p=2, dim=1) ** 2  / self.nsamples
-        self.out = out.clone()
+
+    def get_metric(self):
+        return self.weight_imp * torch.sqrt(self.scaler_row.reshape((1, -1)))**self.theta3
+
+    def prune(self, sparsity_ratio):
+        W_metric = self.get_metric()
+        W_mask = (torch.zeros_like(W_metric) == 1)  
+        sort_res = torch.sort(W_metric, dim=-1, stable=True)
+        indices = sort_res[1][:,:int(W_metric.shape[1]*sparsity_ratio)]
+        W_mask.scatter_(1, indices, True)
+        self.layer.weight.data[W_mask] = 0 
+
+    def clean(self):
+        del self.scaler_row
+        del self.weight_imp
+        gc.collect()
+        torch.cuda.empty_cache()
 
 @torch.no_grad()
 def prepare_calibration_input(model, calib_data, device):
@@ -179,204 +203,89 @@ def prepare_calibration_input(model, calib_data, device):
 
     return inps, outs, cache['kwargs']
 
+def prune_default(model, calib_data, sparsity_ratio, theta1=0.42, theta2=0.51, theta3=0.38, device=torch.device("cuda:0")):
+    use_cache = model.config.use_cache 
+    model.config.use_cache = False 
+
+    reconstruction_errors = []
+    NUM_SAMPLES = len(calib_data)
+
+    print("loading calibration data")
+    print("dataset loading complete")
+    with torch.no_grad():
+        inps, outs, kwargs = prepare_calibration_input(model, calib_data, device)
+
+    layers = model.model.layers
+    for i in range(len(layers)):
+        layer_recon_error = 0
+        layer = layers[i]
+        layer.to(device)
+        subset = find_layers(layer)
+
+        if hasattr(model, "hf_device_map") and f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
+            dev = model.hf_device_map[f"model.layers.{i}"]
+            inps, outs = inps.to(dev), outs.to(dev)
+            n_kwargs = {}
+            for k in kwargs:
+                n_kwargs[k] = kwargs[k].to(dev)
+            kwargs = n_kwargs
+
+        wrapped_layers = {}
+        for name in subset:
+            wrapped_layers[name] = WrappedGPT(subset[name], theta1=theta1, theta2=theta2, theta3=theta3)
+
+        def add_batch(name):
+            def tmp(_, inp, out):
+                wrapped_layers[name].add_batch(inp[0].data, out.data)
+            return tmp
+
+        handles = []
+        for name in wrapped_layers:
+            handles.append(subset[name].register_forward_hook(add_batch(name)))
+
+        for j in range(NUM_SAMPLES):
+            with torch.no_grad():
+                outs[j] = layer(inps[j].unsqueeze(0), **kwargs)[0]
+        for h in handles:
+            h.remove()
+
+        for name in subset:
+            wrapped_layers[name].prune(sparsity_ratio)
+            wrapped_layers[name].clean()
+
+        outs_cache = outs.clone()
+        for j in range(NUM_SAMPLES):
+            with torch.no_grad():
+                outs[j] = layer(inps[j].unsqueeze(0), **kwargs)[0]
+
+        layer_recon_error = ((outs_cache.float() - outs.float())**2).sum().item()
+        
+        reconstruction_errors += [layer_recon_error]
+        print(f"Layer {i} reconstruction error: {layer_recon_error}")
+        inps, outs = outs, inps
+        layer.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    model.config.use_cache = use_cache 
+
+    return reconstruction_errors
+
 
 @torch.no_grad()    
 def prune_wanda(model, calib_data, sparsity_ratio, device=torch.device("cuda:0")):
-    use_cache = model.config.use_cache 
-    model.config.use_cache = False 
-
-    reconstruction_errors = []
-    NUM_SAMPLES = len(calib_data)
-
-    print("loading calibration data")
-    print("dataset loading complete")
-    with torch.no_grad():
-        inps, outs, kwargs = prepare_calibration_input(model, calib_data, device)
-
-    layers = model.model.layers
-    for i in range(len(layers)):
-        layer_recon_error = 0
-        layer = layers[i]
-        layer.to(device)
-        subset = find_layers(layer)
-
-        if hasattr(model, "hf_device_map") and f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
-            dev = model.hf_device_map[f"model.layers.{i}"]
-            inps, outs = inps.to(dev), outs.to(dev)
-            n_kwargs = {}
-            for k in kwargs:
-                n_kwargs[k] = kwargs[k].to(dev)
-            kwargs = n_kwargs
-
-        wrapped_layers = {}
-        for name in subset:
-            wrapped_layers[name] = WrappedGPT(subset[name])
-
-        def add_batch(name):
-            def tmp(_, inp, out):
-                wrapped_layers[name].add_batch(inp[0].data, out.data)
-            return tmp
-
-        handles = []
-        for name in wrapped_layers:
-            handles.append(subset[name].register_forward_hook(add_batch(name)))
-
-        for j in range(NUM_SAMPLES):
-            with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), **kwargs)[0]
-        for h in handles:
-            h.remove()
-
-        out_before_pruning = {}
-        for name in subset:
-            # print(f"pruning layer {i} name {name}")
-            W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
-            out_before_pruning[name] = wrapped_layers[name].out
-
-            W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
-            sort_res = torch.sort(W_metric, dim=-1, stable=True)
-            # unstructured pruning
-            indices = sort_res[1][:,:int(W_metric.shape[1]*sparsity_ratio)]
-            W_mask.scatter_(1, indices, True)
-
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
-
-        def add_out(name):
-            def tmp(_, inp, out):
-                wrapped_layers[name].out = out.data.clone()
-            return tmp
-
-        handles = []
-        for name in wrapped_layers:
-            handles.append(subset[name].register_forward_hook(add_out(name)))
-            
-        for j in range(NUM_SAMPLES):
-            with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), **kwargs)[0]
-
-        for name in subset:
-            out1 = wrapped_layers[name].out
-            out2 = out_before_pruning[name]
-            # print(out1.ravel()[:10],  out2.ravel()[:10])
-            layer_recon_error += ((out1 - out2)**2).sum().item()
-            del out1, out2
-            gc.collect()
-            torch.cuda.empty_cache()
-
-        for h in handles:
-            h.remove()
-        
-        reconstruction_errors += [layer_recon_error]
-        print(f"Layer {i} reconstruction error: {layer_recon_error}")
-        inps, outs = outs, inps
-        layer.to("cpu")
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    model.config.use_cache = use_cache 
-
-    return reconstruction_errors
-
+    def metric_fn(subset, wrapped_layers, name):
+        W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
+        return W_metric
+    return prune_default(model, calib_data, sparsity_ratio, metric_fn, "mine", device=device)
 
 @torch.no_grad()    
 def prune_bawa(model, calib_data, sparsity_ratio, device=torch.device("cuda:0")):
-    use_cache = model.config.use_cache 
-    model.config.use_cache = False 
-
-    reconstruction_errors = []
-    NUM_SAMPLES = len(calib_data)
-
-    print("loading calibration data")
-    print("dataset loading complete")
-    with torch.no_grad():
-        inps, outs, kwargs = prepare_calibration_input(model, calib_data, device)
-
-    layers = model.model.layers
-    for i in range(len(layers)):
-        layer_recon_error = 0
-        layer = layers[i]
-        layer.to(device)
-        subset = find_layers(layer)
-
-        if hasattr(model, "hf_device_map") and f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
-            dev = model.hf_device_map[f"model.layers.{i}"]
-            inps, outs = inps.to(dev), outs.to(dev)
-            n_kwargs = {}
-            for k in kwargs:
-                n_kwargs[k] = kwargs[k].to(dev)
-            kwargs = n_kwargs
-
-        wrapped_layers = {}
-        for name in subset:
-            wrapped_layers[name] = WrappedGPT(subset[name])
-
-        def add_batch(name):
-            def tmp(_, inp, out):
-                wrapped_layers[name].add_batch(inp[0].data, out.data)
-            return tmp
-
-        handles = []
-        for name in wrapped_layers:
-            handles.append(subset[name].register_forward_hook(add_batch(name)))
-
-        for j in range(NUM_SAMPLES):
-            with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), **kwargs)[0]
-        for h in handles:
-            h.remove()
-
-        out_before_pruning = {}
-        for name in subset:
-            # print(f"pruning layer {i} name {name}")
-            w_data = subset[name].weight.data
-            W_metric = torch.abs(w_data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))**0.38 * ((1/w_data.norm(p=2, dim=0).reshape((1,-1))**0.42) + (1/w_data.norm(p=2, dim=1).reshape((-1,1))**0.51))
-            out_before_pruning[name] = wrapped_layers[name].out
-
-            W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
-            sort_res = torch.sort(W_metric, dim=-1, stable=True)
-            # unstructured pruning
-            indices = sort_res[1][:,:int(W_metric.shape[1]*sparsity_ratio)]
-            W_mask.scatter_(1, indices, True)
-
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
-
-        def add_out(name):
-            def tmp(_, inp, out):
-                wrapped_layers[name].out = out.data.clone()
-            return tmp
-
-        handles = []
-        for name in wrapped_layers:
-            handles.append(subset[name].register_forward_hook(add_out(name)))
-            
-        for j in range(NUM_SAMPLES):
-            with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), **kwargs)[0]
-
-        for name in subset:
-            out1 = wrapped_layers[name].out
-            out2 = out_before_pruning[name]
-            # print(out1.ravel()[:10],  out2.ravel()[:10])
-            layer_recon_error += ((out1 - out2)**2).sum().item()
-            del out1, out2
-            gc.collect()
-            torch.cuda.empty_cache()
-
-        for h in handles:
-            h.remove()
-        
-        reconstruction_errors += [layer_recon_error]
-        print(f"Layer {i} reconstruction error: {layer_recon_error}")
-        inps, outs = outs, inps
-        layer.to("cpu")
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    model.config.use_cache = use_cache 
-
-    return reconstruction_errors
-
-
+    def metric_fn(subset, wrapped_layers, name):
+        w_data = subset[name].weight.data
+        W_metric = torch.abs(w_data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))**0.38 * ((1/w_data.norm(p=2, dim=0).reshape((1,-1))**0.42) + (1/w_data.norm(p=2, dim=1).reshape((-1,1))**0.51))
+        return W_metric
+    return prune_default(model, calib_data, sparsity_ratio, metric_fn, device=device)
 
 @torch.no_grad()
 def eval_ppl(model, test_data, seqlen,  bs=1, device=None):
