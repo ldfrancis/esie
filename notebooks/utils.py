@@ -203,6 +203,7 @@ def prepare_calibration_input(model, calib_data, device):
 
     return inps, outs, cache['kwargs']
 
+@torch.no_grad()
 def prune_default(model, calib_data, sparsity_ratio, theta1=0.42, theta2=0.51, theta3=0.38, device=torch.device("cuda:0")):
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
@@ -270,22 +271,6 @@ def prune_default(model, calib_data, sparsity_ratio, theta1=0.42, theta2=0.51, t
     model.config.use_cache = use_cache 
 
     return reconstruction_errors
-
-
-@torch.no_grad()    
-def prune_wanda(model, calib_data, sparsity_ratio, device=torch.device("cuda:0")):
-    def metric_fn(subset, wrapped_layers, name):
-        W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
-        return W_metric
-    return prune_default(model, calib_data, sparsity_ratio, metric_fn, "mine", device=device)
-
-@torch.no_grad()    
-def prune_bawa(model, calib_data, sparsity_ratio, device=torch.device("cuda:0")):
-    def metric_fn(subset, wrapped_layers, name):
-        w_data = subset[name].weight.data
-        W_metric = torch.abs(w_data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))**0.38 * ((1/w_data.norm(p=2, dim=0).reshape((1,-1))**0.42) + (1/w_data.norm(p=2, dim=1).reshape((-1,1))**0.51))
-        return W_metric
-    return prune_default(model, calib_data, sparsity_ratio, metric_fn, device=device)
 
 @torch.no_grad()
 def eval_ppl(model, test_data, seqlen,  bs=1, device=None):
