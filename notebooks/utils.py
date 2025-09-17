@@ -220,7 +220,7 @@ def prune_default(model, calib_data, sparsity_ratio, theta1=0.42, theta2=0.51, t
     for i in range(len(layers)):
         layer_recon_error = 0
         layer = layers[i]
-        layer.to(device)
+        # layer.to(device)
         subset = find_layers(layer)
 
         if hasattr(model, "hf_device_map") and f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
@@ -264,7 +264,7 @@ def prune_default(model, calib_data, sparsity_ratio, theta1=0.42, theta2=0.51, t
         reconstruction_errors += [layer_recon_error]
         print(f"Layer {i} reconstruction error: {layer_recon_error}")
         inps, outs = outs, inps
-        layer.to("cpu")
+        # layer.to("cpu")
         gc.collect()
         torch.cuda.empty_cache()
 
