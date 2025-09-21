@@ -13,3 +13,4 @@ weights/
 .ipynb_checkpoints
 
 __pycache__/
+notebooks/logs
