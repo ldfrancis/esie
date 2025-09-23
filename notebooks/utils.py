@@ -4,6 +4,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 import numpy as np
 import random
+import math
 import gc
 torch.cuda.is_available()
 
@@ -111,7 +112,7 @@ class WrappedGPT:
     This class wraps a GPT layer for specific operations.
     """
 
-    def __init__(self, layer, theta1=0.42, theta2=0.51, theta3=0.38, layer_name="none"):
+    def __init__(self, layer, theta1=0.42, theta2=0.51, theta3=0.38, is_sparsegpt=False):
         self.layer = layer
         self.dev = self.layer.weight.device
         self.rows = layer.weight.data.shape[0]
@@ -120,11 +121,13 @@ class WrappedGPT:
         self.scaler_row = torch.zeros((self.columns), device=self.dev)
         self.nsamples = 0
 
-        self.layer_name = layer_name
-
         self.theta1 = theta1
         self.theta2 = theta2
         self.theta3 = theta3
+
+        self.is_sparsegpt = is_sparsegpt
+        if is_sparsegpt: 
+            self.H = torch.zeros((self.columns, self.columns), device=self.dev)
 
         w = (self.layer.weight.data.clone().float()).abs()
         ws = w**2
@@ -140,23 +143,82 @@ class WrappedGPT:
             if len(inp.shape) == 3:
                 inp = inp.reshape((-1, inp.shape[-1]))
             inp = inp.t()
-        
-        self.scaler_row *= self.nsamples / (self.nsamples+tmp)
+        a = self.nsamples / (self.nsamples+tmp)
+        self.scaler_row *= a
+        if self.is_sparsegpt: self.H *= a
         self.nsamples += tmp
 
+        b = 1 / self.nsamples
         inp = inp.type(torch.float32)
-        self.scaler_row += torch.norm(inp, p=2, dim=1) ** 2  / self.nsamples
+        self.scaler_row += torch.norm(inp, p=2, dim=1) ** 2  * b
+        inp = math.sqrt(2*b)*inp
+        if self.is_sparsegpt: self.H += inp.matmul(inp.t())
 
     def get_metric(self):
         return self.weight_imp * torch.sqrt(self.scaler_row.reshape((1, -1)))**self.theta3
 
-    def prune(self, sparsity_ratio):
-        W_metric = self.get_metric()
-        W_mask = (torch.zeros_like(W_metric) == 1)  
-        sort_res = torch.sort(W_metric, dim=-1, stable=True)
-        indices = sort_res[1][:,:int(W_metric.shape[1]*sparsity_ratio)]
-        W_mask.scatter_(1, indices, True)
-        self.layer.weight.data[W_mask] = 0 
+    def prune(self, sparsity_ratio, prune_n=0, prune_m=0):
+        if self.is_sparsegpt:
+            W = self.layer.weight.data.clone()
+            W = W.float()
+            H = self.H
+            del self.H
+            dead = torch.diag(H) == 0
+            H[dead, dead] = 1
+            W[:, dead] = 0
+            Losses = torch.zeros(self.rows, device=self.dev)
+            percdamp = 0.01
+            blocksize = 128
+            damp = percdamp * torch.mean(torch.diag(H))
+            diag = torch.arange(self.columns, device=self.dev)
+            H[diag, diag] += damp
+            H = torch.linalg.cholesky(H)
+            H = torch.cholesky_inverse(H)
+            H = torch.linalg.cholesky(H, upper=True)
+            Hinv = H
+            mask = None
+            for i1 in range(0, self.columns, blocksize):
+                i2 = min(i1 + blocksize, self.columns)
+                count = i2 - i1
+                W1 = W[:, i1:i2].clone()
+                Q1 = torch.zeros_like(W1)
+                Err1 = torch.zeros_like(W1)
+                Losses1 = torch.zeros_like(W1)
+                Hinv1 = Hinv[i1:i2, i1:i2]
+                if prune_n == 0:
+                    if mask is not None:
+                        mask1 = mask[:, i1:i2]
+                    else:
+                        tmp = W1**2 / (torch.diag(Hinv1).reshape((1, -1)))**2
+                        thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() * sparsity_ratio)]
+                        mask1 = tmp <= thresh
+                else:
+                    mask1 = torch.zeros_like(W1) == 1
+                for i in range(count):
+                    w = W1[:,  i]
+                    d = Hinv1[i, i]
+                    if prune_n != 0 and i%prune_m == 0:
+                        tmp = W1[:, i:(i+prune_m)] ** 2 / (torch.diag(Hinv1)[i:(i+prune_m)].reshape((1, -1)))**2
+                        mask1.scatter_(1, i + torch.topk(tmp, prune_n, dim=1, largest=False)[1], True)
+                    q = w.clone()
+                    q[mask1[:, i]] = 0
+                    Q1[:, i] = q
+                    Losses1[:, i] = (w-q)**2 / d**2
+                    err1 = (w-q)/d
+                    W1[:,i:] -= err1.unsqueeze(1).matmul(Hinv1[i,i:].unsqueeze(0))
+                    Err1[:, i] = err1
+                W[:, i1:i2] = Q1
+                Losses += torch.sum(Losses1, 1)/2
+                W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+            torch.cuda.synchronize()
+            self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.dtype)
+        else:
+            W_metric = self.get_metric()
+            W_mask = (torch.zeros_like(W_metric) == 1)  
+            sort_res = torch.sort(W_metric, dim=-1, stable=True)
+            indices = sort_res[1][:,:int(W_metric.shape[1]*sparsity_ratio)]
+            W_mask.scatter_(1, indices, True)
+            self.layer.weight.data[W_mask] = 0 
 
     def clean(self):
         del self.scaler_row
@@ -176,7 +238,7 @@ def prepare_calibration_input(model, calib_data, device):
         device = model.hf_device_map["model.embed_tokens"]
 
     dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros((NUM_SAMPLES, SEQUENCE_LEN, model.config.hidden_size), dtype=dtype, device=device)
+    inps = torch.zeros((NUM_SAMPLES, SEQUENCE_LEN, model.config.hidden_size), dtype=dtype, device="cpu")
     inps.requires_grad = False
     cache = {'i': 0, 'kwargs':{}}
 
@@ -204,7 +266,7 @@ def prepare_calibration_input(model, calib_data, device):
     return inps, outs, cache['kwargs']
 
 @torch.no_grad()
-def prune_default(model, calib_data, sparsity_ratio, theta1=0.42, theta2=0.51, theta3=0.38, device=torch.device("cuda:0")):
+def prune_default(model, calib_data, sparsity_ratio, theta1=0.42, theta2=0.51, theta3=0.38, is_sparsegpt=False, device=torch.device("cuda:0")):
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
 
@@ -233,7 +295,7 @@ def prune_default(model, calib_data, sparsity_ratio, theta1=0.42, theta2=0.51, t
 
         wrapped_layers = {}
         for name in subset:
-            wrapped_layers[name] = WrappedGPT(subset[name], theta1=theta1, theta2=theta2, theta3=theta3)
+            wrapped_layers[name] = WrappedGPT(subset[name], theta1=theta1, theta2=theta2, theta3=theta3, is_sparsegpt=is_sparsegpt)
 
         def add_batch(name):
             def tmp(_, inp, out):
@@ -246,7 +308,7 @@ def prune_default(model, calib_data, sparsity_ratio, theta1=0.42, theta2=0.51, t
 
         for j in range(NUM_SAMPLES):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), **kwargs)[0]
+                outs[j] = layer(inps[j].unsqueeze(0).to(device), **kwargs)[0].detach().cpu()
         for h in handles:
             h.remove()
 
@@ -254,15 +316,15 @@ def prune_default(model, calib_data, sparsity_ratio, theta1=0.42, theta2=0.51, t
             wrapped_layers[name].prune(sparsity_ratio)
             wrapped_layers[name].clean()
 
-        outs_cache = outs.clone()
+        # outs_cache = outs.clone()
         for j in range(NUM_SAMPLES):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0), **kwargs)[0]
+                outs[j] = layer(inps[j].unsqueeze(0).to(device), **kwargs)[0].detach().cpu()
 
-        layer_recon_error = ((outs_cache.float() - outs.float())**2).sum().item()
+        # layer_recon_error = ((outs_cache.float() - outs.float())**2).sum().item()
         
-        reconstruction_errors += [layer_recon_error]
-        print(f"Layer {i} reconstruction error: {layer_recon_error}")
+        # reconstruction_errors += [layer_recon_error]
+        # print(f"Layer {i} reconstruction error: {layer_recon_error}")
         inps, outs = outs, inps
         # layer.to("cpu")
         gc.collect()
@@ -283,12 +345,12 @@ def eval_ppl(model, test_data, seqlen,  bs=1, device=None):
 
     # List to store negative log likelihoods
     nlls = []
-    print(f"nsamples {nsamples}")
+    # print(f"nsamples {nsamples}")
 
     # Loop through each batch
     for i in range(0,nsamples,bs):
-        if i % 50 == 0:
-            print(f"sample {i}")
+        # if i % 50 == 0:
+        #     print(f"sample {i}")
 
         # Calculate end index
         j = min(i+bs, nsamples)
