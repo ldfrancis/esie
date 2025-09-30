@@ -1,12 +1,15 @@
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import datasets
 from datasets import load_dataset
 import numpy as np
 import random
 import math
 import gc
 torch.cuda.is_available()
+
+datasets.config.HF_DATASETS_CACHE = "/ephemeral/.cache/datasets"
 
 
 
