@@ -7,9 +7,10 @@ import numpy as np
 import random
 import math
 import gc
+import os
 torch.cuda.is_available()
 
-datasets.config.HF_DATASETS_CACHE = "/ephemeral/.cache/datasets"
+# datasets.config.HF_DATASETS_CACHE = "/ephemeral/.cache/datasets"
 
 
 
@@ -88,25 +89,11 @@ def get_fineweb_edu(num_tokens, sequence_length, tokenizer, train = True):
 
 # Wanda pruning implementation - https://github.com/locuslab/wanda/blob/main/lib/eval.py
 
-def find_layers(module, layers=[nn.Linear], name=''):
-    """
-    Recursively find the layers of a certain type in a module.
-
-    Args:
-        module (nn.Module): PyTorch module.
-        layers (list): List of layer types to find.
-        name (str): Name of the module.
-
-    Returns:
-        dict: Dictionary of layers of the given type(s) within the module.
-    """
-    if type(module) in layers:
-        return {name: module}
+def find_layers(module):
     res = {}
-    for name1, child in module.named_children():
-        res.update(find_layers(
-            child, layers=layers, name=name + '.' + name1 if name != '' else name1
-        ))
+    for name, layer in module.named_modules():
+        if isinstance(layer, nn.Linear):
+            res[name] = layer
     return res
 
 
@@ -118,8 +105,10 @@ class WrappedGPT:
     def __init__(self, layer, theta1=0.42, theta2=0.51, theta3=0.38, is_sparsegpt=False):
         self.layer = layer
         self.dev = self.layer.weight.device
+        # print(self.dev)
         self.rows = layer.weight.data.shape[0]
         self.columns = layer.weight.data.shape[1]
+        self.weight = self.layer.weight.data.clone()
 
         self.scaler_row = torch.zeros((self.columns), device=self.dev)
         self.nsamples = 0
@@ -132,13 +121,19 @@ class WrappedGPT:
         if is_sparsegpt: 
             self.H = torch.zeros((self.columns, self.columns), device=self.dev)
 
-        w = (self.layer.weight.data.clone().float()).abs()
-        ws = w**2
-        wrow = 1/ws.sum(dim=0, keepdims=True).sqrt()
-        wcol = 1/ws.sum(dim=1, keepdims=True).sqrt()
-        self.weight_imp = 0.5*w * (wrow**(self.theta1) + wcol**(self.theta2))
-
+        w = (self.weight.float()).abs()
+        if theta1 == 0 and theta2 == 0:
+            self.weight_imp = 0.5*w
+        else:
+            ws = w**2
+            wrow = 1/ws.sum(dim=0, keepdims=True).sqrt()
+            wcol = 1/ws.sum(dim=1, keepdims=True).sqrt()
+            self.weight_imp = 0.5*w * (wrow**(self.theta1) + wcol**(self.theta2))
+        # print(self.scaler_row.device)
+        
     def add_batch(self, inp, out):
+        # print(self.scaler_row.device)
+        self.scaler_row = self.scaler_row.to(inp.device)
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
         tmp = inp.shape[0]
@@ -153,6 +148,8 @@ class WrappedGPT:
 
         b = 1 / self.nsamples
         inp = inp.type(torch.float32)
+        # print(self.scaler_row.device)
+        # print(inp.device)
         self.scaler_row += torch.norm(inp, p=2, dim=1) ** 2  * b
         inp = math.sqrt(2*b)*inp
         if self.is_sparsegpt: self.H += inp.matmul(inp.t())
@@ -160,12 +157,12 @@ class WrappedGPT:
     def get_metric(self):
         return self.weight_imp * torch.sqrt(self.scaler_row.reshape((1, -1)))**self.theta3
 
-    def prune(self, sparsity_ratio, prune_n=0, prune_m=0):
+    def prune(self, sparsity_ratio, prune_n=0, prune_m=0, modify=False):
+        weight = None
         if self.is_sparsegpt:
-            W = self.layer.weight.data.clone()
+            W = self.weight if not modify else self.layer.weight.data
             W = W.float()
             H = self.H
-            del self.H
             dead = torch.diag(H) == 0
             H[dead, dead] = 1
             W[:, dead] = 0
@@ -214,18 +211,27 @@ class WrappedGPT:
                 Losses += torch.sum(Losses1, 1)/2
                 W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
             torch.cuda.synchronize()
-            self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.dtype)
+            weight = W.reshape(self.weight.shape).to(self.weight.dtype)
         else:
             W_metric = self.get_metric()
             W_mask = (torch.zeros_like(W_metric) == 1)  
             sort_res = torch.sort(W_metric, dim=-1, stable=True)
             indices = sort_res[1][:,:int(W_metric.shape[1]*sparsity_ratio)]
             W_mask.scatter_(1, indices, True)
-            self.layer.weight.data[W_mask] = 0 
+            if not modify:
+                self.weight[W_mask] = 0
+            else:
+                self.layer.weight.data[W_mask] = 0
+            weight = self.weight
+        
+        return weight
 
     def clean(self):
         del self.scaler_row
         del self.weight_imp
+        del self.weight
+        if self.is_sparsegpt:
+            del self.H
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -233,7 +239,7 @@ class WrappedGPT:
 def prepare_calibration_input(model, calib_data, device):
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    layers = model.model.layers
+    layers = model.model.decoder.layers
     NUM_SAMPLES = len(calib_data)
     SEQUENCE_LEN = calib_data[0].shape[1]
 
@@ -255,7 +261,8 @@ def prepare_calibration_input(model, calib_data, device):
             cache['kwargs'].update(kwargs)
             raise ValueError
     layers[0] = Catcher(layers[0])
-    model.model.embed_tokens.to(device)
+    model.model.decoder.embed_tokens.to(device)
+    model.model.decoder.embed_positions.to(device)
     for sample in calib_data:
         try:
             model(sample.to(device))
@@ -269,7 +276,7 @@ def prepare_calibration_input(model, calib_data, device):
     return inps, outs, cache['kwargs']
 
 @torch.no_grad()
-def prune_default(model, calib_data, sparsity_ratio, theta1=0.42, theta2=0.51, theta3=0.38, is_sparsegpt=False, device=torch.device("cuda:0")):
+def prune_default(model, calib_data, sparsity_ratios, theta1=0.42, theta2=0.51, theta3=0.38, is_sparsegpt=False, device=torch.device("cuda:0"), save_dir=""):
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
 
@@ -281,11 +288,14 @@ def prune_default(model, calib_data, sparsity_ratio, theta1=0.42, theta2=0.51, t
     with torch.no_grad():
         inps, outs, kwargs = prepare_calibration_input(model, calib_data, device)
 
-    layers = model.model.layers
+    layers = model.model.decoder.layers
+    if len(sparsity_ratios) == 1:
+        sparsity_ratios = sparsity_ratios * len(layers)
     for i in range(len(layers)):
+        layer_sparsity_ratios = sparsity_ratios[i]
         layer_recon_error = 0
         layer = layers[i]
-        # layer.to(device)
+        layer.to(device)
         subset = find_layers(layer)
 
         if hasattr(model, "hf_device_map") and f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
@@ -298,6 +308,7 @@ def prune_default(model, calib_data, sparsity_ratio, theta1=0.42, theta2=0.51, t
 
         wrapped_layers = {}
         for name in subset:
+            # print(subset[name].weight.device)
             wrapped_layers[name] = WrappedGPT(subset[name], theta1=theta1, theta2=theta2, theta3=theta3, is_sparsegpt=is_sparsegpt)
 
         def add_batch(name):
@@ -311,12 +322,32 @@ def prune_default(model, calib_data, sparsity_ratio, theta1=0.42, theta2=0.51, t
 
         for j in range(NUM_SAMPLES):
             with torch.no_grad():
-                outs[j] = layer(inps[j].unsqueeze(0).to(device), **kwargs)[0].detach().cpu()
+                ins = inps[j].unsqueeze(0).to(device)
+                # print(ins.device, next(layer.parameters()).device)
+                outs[j] = layer(ins, **kwargs)[0].detach().cpu()
         for h in handles:
             h.remove()
 
         for name in subset:
-            wrapped_layers[name].prune(sparsity_ratio)
+            if not isinstance(layer_sparsity_ratios, list):
+                layer_sparsity_ratios = [layer_sparsity_ratios]
+            for i,sparsity_ratio in enumerate(layer_sparsity_ratios):
+                if sparsity_ratio == 0:
+                    continue
+                if i == len(layer_sparsity_ratios)-1:
+                    modify=True
+                else:
+                    modify=False
+                weight = wrapped_layers[name].prune(sparsity_ratio, modify=modify)
+
+                # save weight to disk
+                if save_dir:
+                    save_file = os.path.join(
+                        save_dir, ("sparsegpt" if is_sparsegpt else f"standard_{theta1}_{theta2}_{theta3}"), f"model.layers.{i}.{name}",
+                        f"{sparsity_ratio}.pth"
+                    )
+                    os.makedirs(os.path.dirname(save_file), exist_ok=True)
+                    torch.save(weight, save_file)
             wrapped_layers[name].clean()
 
         # outs_cache = outs.clone()
@@ -388,3 +419,27 @@ def eval_ppl(model, test_data, seqlen,  bs=1, device=None):
 
     return ppl.item()
 
+
+@torch.no_grad()
+def load_layers(model, layer_sparsity_ratios, dir):
+    layers = model.model.layers
+    weights = [None]*len(layers)
+    for i in range(len(layers)):
+        layer = layers[i]
+        sparsity_ratio = layer_sparsity_ratios[i]
+        subset = find_layers(layer)
+        for name in subset:
+            if sparsity_ratio == 0:
+                continue
+            weight_file = os.path.join(
+                dir, f"model.layers.{i}.{name}",
+                f"{sparsity_ratio}.pth"
+            )
+            if not os.path.exists(weight_file):
+                print(f"Weight file {weight_file} does not exist, skipping...")
+                continue
+            weight = torch.load(weight_file)
+            weights[i] = weight
+            layer_weight = subset[name].weight.data
+            layer_weight.copy_(weights[i].to(layer_weight.dtype).to(layer_weight.device), non_blocking=True)
+    
