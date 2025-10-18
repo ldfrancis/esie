@@ -295,29 +295,32 @@ def evopress(model, calibration_data, eval_datasets):
 ######################################################################################################################################
 # RLPress
 class Environment:
-    def __init__(self, model, test_data,  num_layers, num_layers_in_block, num_levels, weights_path=""):
-        self.num_layers = num_layers
-        self.num_layers_in_block = num_layers_in_block
+    def __init__(self, model, test_data, num_blocks, model_blocks_attr, modules_in_block, num_levels, weights_path=""):
+        self.num_blocks = num_blocks
+        self.modules_in_block = modules_in_block
+        self.num_modules_in_block = len(modules_in_block)
         self.num_levels = num_levels
+        self.blocks = None
+
+        temp = model
+        for attr_name in model_blocks_attr.split("."):
+            temp = getattr(temp, attr_name)
+        self.blocks = temp
+
         self.weights_path = weights_path
         self.model = model
-        self.layer_names = [name for name, m in model.named_modules() if (isinstance(m, torch.nn.Linear) and "model.decoder.layers." in name)]
         self.test_data = test_data
-        self.history_rewards = [-float("inf")]*5
-        self.competition = False
 
     def init(self):
-        self.cur_layer = 0
+        self.cur_block = 0
         self.levels_sum = 0
-        self.layer_levels = [[] for _ in range(self.num_layers)]
         self.possible_levels = list(range(-self.num_levels, self.num_levels + 1))
-        self.model.state = [None] * (self.num_layers * self.num_layers_in_block)
-        
+        self.model.state = [0] * (self.num_blocks * self.num_modules_in_block)
+
     def get_state(self):
-        # mask = [1 if np.mean([v for levels in self.layer_levels[:self.cur_layer] for v in levels]) else 0 for l in self.possible_levels]
-        state = {
-            "state": torch.tensor([self.cur_layer/self.num_layers, self.levels_sum/(self.num_layers*self.num_levels)]).float(),
-        }
+        # an action that leads to an unrecoverable state will be masked out. If the current level-sum
+        # cannot be cancelled out in the next layer
+        mask = torch.zeros(self.num_levels)
         return state
  
     def reset(self):

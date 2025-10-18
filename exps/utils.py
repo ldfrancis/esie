@@ -10,7 +10,7 @@ import gc
 import os
 torch.cuda.is_available()
 
-datasets.config.HF_DATASETS_CACHE = "/ephemeral/.cache/datasets"
+# datasets.config.HF_DATASETS_CACHE = "/ephemeral/.cache/datasets"
 
 
 

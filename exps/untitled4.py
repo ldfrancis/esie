@@ -1,7 +1,7 @@
 # EvoPress
 import os
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 import random
@@ -294,62 +294,226 @@ def evopress(model, calibration_data, eval_datasets):
 
 ######################################################################################################################################
 # RLPress
+device = "cuda"
+N = 19
+S = 3
 class Environment:
-    def __init__(self, model, test_data,  num_layers, num_layers_in_block, num_levels, weights_path=""):
-        self.num_layers = num_layers
-        self.num_layers_in_block = num_layers_in_block
-        self.num_levels = num_levels
-        self.weights_path = weights_path
-        self.model = model
-        self.layer_names = [name for name, m in model.named_modules() if (isinstance(m, torch.nn.Linear) and "model.decoder.layers." in name)]
-        self.test_data = test_data
-        self.history_rewards = [-float("inf")]*5
-        self.competition = False
-
-    def init(self):
-        self.cur_layer = 0
-        self.levels_sum = 0
-        self.layer_levels = [[] for _ in range(self.num_layers)]
-        self.possible_levels = list(range(-self.num_levels, self.num_levels + 1))
-        self.model.state = [None] * (self.num_layers * self.num_layers_in_block)
+    def __init__(self, model_name:str, num_samples:int, sequence_length:int, target_sparsity:float=0.5)->None:
+        self.model_name = model_name
+        self.num_samples = num_samples
+        self.sequence_length = sequence_length
+        self.target_sparsity = target_sparsity
+        self.num_samples = num_samples
+        self.sequence_length = sequence_length
+        self.possible_sparsities = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+        self.device = device if torch.cuda.is_available() else "cpu"
         
-    def get_state(self):
-        # mask = [1 if np.mean([v for levels in self.layer_levels[:self.cur_layer] for v in levels]) else 0 for l in self.possible_levels]
-        state = {
-            "state": torch.tensor([self.cur_layer/self.num_layers, self.levels_sum/(self.num_layers*self.num_levels)]).float(),
+        # initialize state
+        self.load_calibration_data()
+        self.reset()
+
+    def load_calibration_data(self):
+        # caliberation data
+        tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        self.tokenizer = tokenizer
+        num_tokens = self.num_samples * self.sequence_length
+        self.calib_data = get_fineweb_edu(num_tokens, self.sequence_length, tokenizer, train=True)
+        # self.test_data = get_fineweb_edu(num_tokens, self.sequence_length, tokenizer, train=False)
+        _, self.test_data = get_w2_data(self.num_samples, self.sequence_length, tokenizer)
+
+    @torch.no_grad()
+    def init(self) -> None:
+        # create model, tokenizer, and calibration data.
+        # model and tokenizer
+        model = AutoModelForCausalLM.from_pretrained(self.model_name, dtype=torch.float16, device_map="auto")
+        tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        self.model = model
+        self.tokenizer = tokenizer
+
+        # caliberation data
+        test_data = self.test_data
+
+        # env attributes
+        self.action_mask = torch.ones(N)
+        self.layers = model.model.decoder.layers
+        self.num_layers = len(self.layers)
+        self.current_layer = 0
+        self.global_sparsity = 0.0
+        self.layer_sparsities = [0.0] * self.num_layers
+        self.pruning_info = {}
+
+        # buffers
+        self.inps = torch.zeros((self.num_samples, self.sequence_length, model.config.hidden_size), dtype=torch.float16, device=self.device)
+        self.outs = torch.zeros_like(self.inps)
+        self.inp_kwargs = {}
+
+        # obtain input into the first decoder layer
+        cache = model.config.use_cache
+        model.config.use_cache = False
+        inps = self.inps
+        inp_kwargs = self.inp_kwargs
+        class catch_inps(nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+                self.num_inps = 0
+            def forward(self, inp, **kwargs):
+                nonlocal inps, inp_kwargs
+                inps[self.num_inps] = inp
+                inp_kwargs.update(kwargs)
+                self.num_inps += 1
+                raise Exception("caught inps. Stopping forward pass.")
+        self.layers[0] = catch_inps(self.layers[0])
+        for sample in self.calib_data:
+            try:
+                model(sample.to(self.device))
+            except Exception as e:
+                pass
+        self.layers[0] = self.layers[0].module
+        self.inps = inps
+        self.inp_kwargs = inp_kwargs
+
+        # save the log targets to a file for computing the KL divergence later
+        # i_batches = 0
+        # os.makedirs(f"logs/kl/{self.model_name}", exist_ok=True)
+        # batch_size = 4
+        # log_probs = []
+        # for j in range(self.num_samples):
+        #     if os.path.exists(f"logs/kl/{self.model_name}/log_targets_{(j//batch_size)}_{batch_size}.pt"):
+        #         i_batches = j // batch_size
+        #         continue
+        #     sample = test_data[j]
+        #     logits = model(sample.to(self.device)).logits
+        #     log_probs.append(F.log_softmax(logits.float(), dim=-1).reshape(-1, model.config.vocab_size).cpu())
+        #     if j % batch_size == batch_size-1:
+        #         log_probs = torch.cat(log_probs, dim=0).cpu()
+        #         torch.save(log_probs, f"logs/kl/{self.model_name}/log_targets_{i_batches}_{batch_size}.pt")
+        #         print(f"Saved logs/kl/{self.model_name}/log_targets_{i_batches}_{batch_size}.pt")
+        #         log_probs = []
+        #     elif j == self.num_samples - 1 and len(log_probs) > 0:
+        #         log_probs = torch.cat(log_probs, dim=0).cpu()
+        #         torch.save(log_probs, f"logs/kl/{self.model_name}/log_targets_{i_batches}_{batch_size}.pt")
+        #         print(f"Saved logs/kl/{self.model_name}/log_targets_{i_batches}_{batch_size}.pt")
+        #     i_batches = j // batch_size
+            
+        # # create a dataloader for computing KL divergence later
+        # model_name = self.model_name
+        # class KLDataset(torch.utils.data.Dataset):
+        #     def __init__(self):
+        #         self.path_format = f"logs/kl/{model_name}"+"/log_targets_{}_{}.pt"
+        #     def __len__(self):
+        #         return i_batches + 1
+        #     def __getitem__(self, idx):
+        #         nonlocal batch_size
+        #         samples = torch.cat(test_data[idx*batch_size:(idx+1)*batch_size], dim=0)
+        #         log_probs = torch.load(self.path_format.format(idx, batch_size))
+        #         return samples, log_probs
+        # self.kl_dataloader = torch.utils.data.DataLoader(KLDataset(), batch_size=1, shuffle=False)
+        # print(f"KL dataloader with {len(self.kl_dataloader)} batches created.")
+        model.config.use_cache = cache
+
+    def prune_layer(self, layer_idx:int, sparsity:float)->None:
+        if layer_idx in self.pruning_info:
+            raise Exception(f"Layer {layer_idx} already pruned. Skipping.")
+        
+        layer = self.layers[layer_idx]
+        sublayers = {name: module for name, module in layer.named_modules() if isinstance(module, nn.Linear)}
+        wrapped_layers = {}
+        for name, sublayer in sublayers.items():
+            wrapped_layers[name] = WrappedGPT(sublayer)
+
+        # obtain the input activations to each sublayer, computing the feature-wise norms
+        def add_batch(name):
+            def tmp(_, inp, out):
+                wrapped_layers[name].add_batch(inp[0].data, out.data)
+            return tmp
+        handles = []
+        for name in wrapped_layers:
+            handles.append(sublayers[name].register_forward_hook(add_batch(name)))
+        for j in range(self.num_samples):
+            self.outs[j] = layer(self.inps[j].unsqueeze(0), **self.inp_kwargs)[0]
+        for h in handles:
+            h.remove()
+        
+        for name in sublayers:
+            wrapped_layers[name].prune(sparsity, modify=True)
+            wrapped_layers[name].clean()
+
+        # outputs after pruning
+        for j in range(self.num_samples):
+            with torch.no_grad():
+                self.outs[j] = layer(self.inps[j].unsqueeze(0), **self.inp_kwargs)[0]
+
+        # the output from this layer should be the input to the next layer
+        self.inps, self.outs = self.outs, self.inps
+
+        # done pruning this layer. Prepare some info about this layer's pruning
+        obtained_sparsity = np.mean([l.weight.data.eq(0).float().mean().item() for l in sublayers.values()]).item()
+        info = {
+            "layer": layer_idx,
+            "layer_target_sparsity": sparsity,
+            "layer_obtained_sparsity": obtained_sparsity,
         }
-        return state
- 
-    def reset(self):
+        self.pruning_info[layer_idx] = info
+
+    def reset(self) -> Dict[str, torch.Tensor]:
+        if hasattr(self, "inps"):
+            del self.inps, self.outs, self.inp_kwargs
+            # del self.kl_dataloader
+            del self.model, self.tokenizer
+        torch.cuda.empty_cache()
         self.init()
         return self.get_state(), {}
 
-    def step(self, action):
-        level = self.possible_levels[action]
-        self.layer_levels[self.cur_layer].extend([level]*self.num_layers_in_block)
-        self.levels_sum += level
-        self.cur_layer += 1
-        done = self.cur_layer == self.num_layers
+    def get_state(self) -> Dict[str, torch.Tensor]:
+        s = [self.global_sparsity, self.target_sparsity, self.current_layer / self.num_layers]
+        if self.current_layer == 0:
+            mask = [1] * len(self.possible_sparsities)
+        else:
+            mask = [1 if (sum(self.layer_sparsities[:self.current_layer]) + s) / self.current_layer <= self.target_sparsity else 0 for s in self.possible_sparsities]
+        state = {
+            "state": torch.tensor(s, dtype=torch.float32),
+            "action_mask": torch.tensor(mask, dtype=torch.float32)
+        }
+        return state
+
+    @torch.no_grad()
+    def step(self, action:int)->Tuple[Dict[str, torch.Tensor], float, bool, Dict[str, object]]:
+        sparsity = self.possible_sparsities[action]
+        self.prune_layer(self.current_layer, sparsity)
+        # update global sparsity
+        self.layer_sparsities[self.current_layer] = sparsity
+        self.current_layer += 1
+        self.global_sparsity = np.mean(self.layer_sparsities[:self.current_layer])
+        # compute reward
         reward = 0
+        done = self.current_layer == self.num_layers
         if done:
-            _layer_levels = [l for levels in self.layer_levels for l in levels]
-            load_layers(self.model, self.layer_names, _layer_levels, self.weights_path)
-            reward = -(abs(self.levels_sum))  # we want to minimize the total sparsity deviation
-            ppl = eval_ppl(self.model, self.test_data, self.test_data[0].shape[-1], device="cuda")
-            reward -= ppl 
-            if all(v == 0 for v in _layer_levels):
-                reward -= 100  # discourage uniform model
+            # compute KL divergence between the pruned and unpruned model.
+            # the logits have been saved to a file during initialization.
+            running_kl = 0.0
+            total_logprobs = 0
+            # for batch in self.kl_dataloader:
+            #     inps, target_log_probs = [batch[0].squeeze(0), batch[1].squeeze(0)]
+            #     logits = self.model(inps.to(self.device)).logits.reshape(-1, self.model.config.vocab_size)
+            #     log_probs = F.log_softmax(logits.float(), dim=-1)
+            #     kl = F.kl_div(log_probs, target_log_probs.to(self.device), reduction="batchmean", log_target=True).item()
+            #     running_kl *= (total_logprobs / (total_logprobs + target_log_probs.numel()))
+            #     running_kl += (target_log_probs.numel() / (total_logprobs + target_log_probs.numel())) * kl
+            #     total_logprobs += target_log_probs.numel()
+            #     del target_log_probs, logits, kl
+            #     torch.cuda.empty_cache()
+            # reward = -running_kl
+            ppl = eval_ppl(self.model, self.test_data, self.sequence_length, device=self.device)
+            reward = -ppl
             self.ppl = ppl
-            if self.competition:
-                self.history_rewards.append(reward)
-                self.history_rewards.pop(0)
-                if reward > np.mean(self.history_rewards):
-                    reward = 1
-                else:
-                    reward = -1
 
         return self.get_state(), reward, done, False, {}
-
+    
 class Policy(nn.Module):
     def __init__(self, state_size:int, action_size:int, device:str="cuda"):
         super(Policy, self).__init__()
@@ -372,12 +536,12 @@ class Policy(nn.Module):
         return super().to(device)
 
     def forward(self, state:Dict[str, torch.Tensor]) -> torch.Tensor:
-        # large_neg = torch.finfo(state.dtype).min
-        # action_mask = state[:, -self.action_size:]
+        large_neg = torch.finfo(state.dtype).min
+        action_mask = state[:, -self.action_size:]
 
         x = self.base(state)
         logits = self.head(x)
-        # logits = torch.where(action_mask.to(self.device) == 1, logits, large_neg)
+        logits = torch.where(action_mask.to(self.device) == 1, logits, large_neg)
         
         probs = F.softmax(logits, dim=-1)
         dist = torch.distributions.Categorical(probs)
@@ -658,8 +822,8 @@ class PolicyValueRollout:
         step = 0
         while not done:
             # import pdb; pdb.set_trace()
-            # state = torch.cat([state["state"], state["action_mask"]], dim=0).float().to(self.policy_n_value.device)
-            state = state["state"].to(self.policy_n_value.device)
+            state = torch.cat([state["state"], state["action_mask"]], dim=0).float().to(self.policy_n_value.device)
+            # state = state["state"].to(self.policy_n_value.device)
             if not deterministic:
                 action, log_prob, _, value = self.policy_n_value.get_action_and_value(state.unsqueeze(0))
             else:
@@ -703,7 +867,8 @@ class Trainer:
                 "Iteration Time": end_time - start_time,
                 "Iteration": iter + 1,
                 "ppl_eval/W2": self.env.ppl,
-                "levels_sum": self.env.levels_sum
+                "obtained_sparsity": self.env.global_sparsity,
+                # "levels_sum": self.env.levels_sum
             }
             wandb.log(data)
             print(f"Iteration {iter+1}/{num_iters}, Loss: {loss:.4f}, Rew: {rew:.2f}, Global Step: {learner_results['global_step']}, Time: {end_time - start_time:.2f}s")
@@ -743,12 +908,13 @@ def rlpress(model, calibration_data, eval_datasets):
     device = "cuda"
     num_layers_in_block = 6
     num_levels = 3
-    N = 2 * num_levels + 1
-    S = 2
-    env = Environment(model, eval_datasets[0], num_layers=12, num_layers_in_block=num_layers_in_block, num_levels=num_levels, weights_path=args["sparse_weights_path"])
+    N = 10 # 2 * num_levels + 1
+    S = 3
+    # env = Environment(model, eval_datasets[0], num_layers=12, num_layers_in_block=num_layers_in_block, num_levels=num_levels, weights_path=args["sparse_weights_path"])
+    env = Environment(model_name=args["model_name_or_path"], num_samples=128, sequence_length=2048, target_sparsity=0.5)
 
-    policy_model = Policy(state_size=S, action_size=N, device=device)
-    value_model = Value(state_size=S, device=device)
+    policy_model = Policy(state_size=S+N, action_size=N, device=device)
+    value_model = Value(state_size=S+N, device=device)
 
     policy_n_value = PolicyValue(policy_model, value_model)
     policy_n_value.to(device)
@@ -772,6 +938,5 @@ calib_data = get_fineweb_edu(num_tokens, sequence_length, tokenizer, train=True)
 _, test_data = get_w2_data(num_samples, sequence_length, tokenizer)
 eval_datasets = [test_data]
 
-breakpoint()
 # evopress(model, calib_data, eval_datasets)
 rlpress(model, calib_data, eval_datasets)
