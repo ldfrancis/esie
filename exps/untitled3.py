@@ -85,6 +85,17 @@ def load_layers(model: AutoModelForCausalLM, layer_names: List[str], new_state: 
     # Update model state
     model.state = new_state
 
+def load_modules(model: AutoModelForCausalLM, module_names: List[str], new_state: List[int], sparse_weights_path: str):
+    assert hasattr(model, "state")
+    for module_name, new_level, old_level in zip(module_names, new_state, model.state):
+        if new_level != old_level:
+            module = model.get_submodule(module_name)
+            module.weight.data = torch.load(
+                os.path.join(sparse_weights_path, module_name, f"{new_level}.pth"), map_location=module.weight.device
+            ).to(module.weight.dtype)
+    # Update model state
+    model.state = new_state
+
 def compute_fitness(model, data, fitness_fn, target_logits: Optional[torch.Tensor] = None) -> float:
     if fitness_fn == "ppl":
         return eval_ppl(model, data, data[0].shape[-1], device="cuda")
@@ -311,17 +322,60 @@ class Environment:
         self.model = model
         self.test_data = test_data
 
+        self.module_names = []
+        for block_idx in range(self.num_blocks):
+            for module_name in modules_in_block:
+                full_module_name = f"{model_blocks_attr}.{block_idx}.{module_name}"
+                self.module_names.append(full_module_name)
+        assert len(self.module_names) == self.num_blocks * self.num_modules_in_block
+
     def init(self):
         self.cur_block = 0
+        self.cur_module_idx = 0
         self.levels_sum = 0
         self.possible_levels = list(range(-self.num_levels, self.num_levels + 1))
         self.model.state = [0] * (self.num_blocks * self.num_modules_in_block)
+        self.chosen_levels = [0] * (self.num_blocks * self.num_modules_in_block)
 
     def get_state(self):
-        # an action that leads to an unrecoverable state will be masked out. If the current level-sum
-        # cannot be cancelled out in the next layer
-        mask = torch.zeros(self.num_levels)
-        return state
+        # ensure action would result in a level sum that can be cancelled out in the remaining modules
+        num_modules = self.num_blocks * self.num_modules_in_block
+        overall_module_idx = self.cur_block * self.num_modules_in_block + self.cur_module_idx
+        num_used_modules = overall_module_idx + 1
+        num_remaining_modules = num_modules - num_used_modules
+        cur_level_sum = sum(self.chosen_levels[:overall_module_idx])
+        masks = [1] * len(self.possible_levels)
+
+        def sign(x):
+            return 1 if x >= 0 else -1
+        
+        for i, possible_next_level in enumerate(self.possible_levels):
+            projected_level_sum = cur_level_sum + possible_next_level
+            # can the projected level sum be cancelled out in the remaining modules?
+            max_negative_sums = -self.num_levels * num_remaining_modules
+            max_positive_sums = self.num_levels * num_remaining_modules
+            neg_sum = projected_level_sum + max_negative_sums
+            pos_sum = projected_level_sum + max_positive_sums
+            if (
+                (neg_sum == 0 or pos_sum == 0) or 
+                (sign(projected_level_sum) != sign(pos_sum)) or 
+                (sign(projected_level_sum) != sign(neg_sum))
+            ):
+                masks[i] = 1
+            elif (
+                (projected_level_sum == 0 and num_remaining_modules < 2) or
+                (sign(projected_level_sum) == sign(neg_sum)) or
+                (sign(projected_level_sum) == sign(pos_sum))
+            ):
+                masks[i] = 0
+            
+        masks = torch.tensor(masks, dtype=torch.float16)
+        return {
+            "state": torch.tensor(
+                [overall_module_idx/num_modules, cur_level_sum / (num_modules*self.num_levels)], dtype=torch.float16
+            ),
+            "action_mask": masks,
+        }
  
     def reset(self):
         self.init()
@@ -329,27 +383,21 @@ class Environment:
 
     def step(self, action):
         level = self.possible_levels[action]
-        self.layer_levels[self.cur_layer].extend([level]*self.num_layers_in_block)
-        self.levels_sum += level
-        self.cur_layer += 1
-        done = self.cur_layer == self.num_layers
+        self.chosen_levels[self.cur_block * self.num_modules_in_block + self.cur_module_idx] = level
+        self.cur_module_idx += 1
+        if self.cur_module_idx == self.num_modules_in_block:
+            self.cur_block += 1
+            self.cur_module_idx = 0
+        overall_module_idx = self.cur_block * self.num_modules_in_block + self.cur_module_idx
+        done = overall_module_idx >= self.num_blocks * self.num_modules_in_block
         reward = 0
         if done:
-            _layer_levels = [l for levels in self.layer_levels for l in levels]
-            load_layers(self.model, self.layer_names, _layer_levels, self.weights_path)
-            reward = -(abs(self.levels_sum))  # we want to minimize the total sparsity deviation
+            load_modules(self.model, self.module_names, self.chosen_levels, self.weights_path)
             ppl = eval_ppl(self.model, self.test_data, self.test_data[0].shape[-1], device="cuda")
-            reward -= ppl 
-            if all(v == 0 for v in _layer_levels):
-                reward -= 100  # discourage uniform model
+            reward = -ppl 
+            if all(v == 0 for v in self.chosen_levels):
+                reward *= 2  # discourage uniform model
             self.ppl = ppl
-            if self.competition:
-                self.history_rewards.append(reward)
-                self.history_rewards.pop(0)
-                if reward > np.mean(self.history_rewards):
-                    reward = 1
-                else:
-                    reward = -1
 
         return self.get_state(), reward, done, False, {}
 
@@ -375,12 +423,12 @@ class Policy(nn.Module):
         return super().to(device)
 
     def forward(self, state:Dict[str, torch.Tensor]) -> torch.Tensor:
-        # large_neg = torch.finfo(state.dtype).min
-        # action_mask = state[:, -self.action_size:]
+        large_neg = torch.finfo(state.dtype).min
+        action_mask = state[:, -self.action_size:]
 
         x = self.base(state)
         logits = self.head(x)
-        # logits = torch.where(action_mask.to(self.device) == 1, logits, large_neg)
+        logits = torch.where(action_mask.to(self.device) == 1, logits, large_neg)
         
         probs = F.softmax(logits, dim=-1)
         dist = torch.distributions.Categorical(probs)
@@ -389,6 +437,9 @@ class Policy(nn.Module):
     def uniform_init(self):
         bias = self.head.bias.data.detach().clone()
         bias = torch.ones_like(bias)*(1/self.action_size)
+        with torch.no_grad():
+            uniform_idx = (self.action_size + 1)//2
+            bias[uniform_idx] += 1
         self.head.bias.data.copy_(bias)
 
     @torch.no_grad()
@@ -507,44 +558,6 @@ def process_trajectories(trajectories, gamma, lam, device):
     # advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
     return states, actions, log_probs, values, returns, advantages
 
-
-class Logger:
-    def __init__(self):
-        self.step = 0
-
-    def log(self, metrics:Dict[str, float], step:Optional[int]=None):
-        raise NotImplementedError
-    
-    def term(self, *args):
-        print(*args)
-
-
-class WandBLogger(Logger):
-    def __init__(self, entity:str="ldfrancis", project_name:str="RLPress"):
-        super().__init__()
-        wandb.init(project=project_name, entity=entity)
-
-    def log(self, metrics:Dict[str, float], step:Optional[int]=None):
-        if step is None:
-            step = self.step
-            self.step += 1
-        wandb.log(metrics, step=step)
-
-
-class TerminalLogger(Logger):
-    def __init__(self):
-        super().__init__()
-
-    def log(self, metrics:Dict[str, float], step:Optional[int]=None):
-        if step is None:
-            step = self.step
-            self.step += 1
-        print(f"Step {step}:")
-        for k, v in metrics.items():
-            print(f"\t{k} : {v}")
-        print("\n")
-
-
 class RLLearner:
     def __init__(self, policy_n_value:PolicyValue, gamma: float = 0.99, lam: float = 0.95, lr=1e-4, device: str = "cuda"):
         self.policy_n_value = policy_n_value
@@ -573,45 +586,54 @@ class RLLearner:
         old_approx_kls = []
         grad_steps = 0
 
+        self.scaler = torch.cuda.amp.GradScaler(
+            enabled=(torch.cuda.is_available() and "cuda" in str(self.device))
+        )
+
         for epoch in range(epochs):
             stop_updates = False
             np.random.shuffle(inds)
             # self.policy_optimizer.zero_grad(); self.value_optimizer.zero_grad()
             for start in range(0, len(states), bs):
+                
                 end = min(start+bs, len(states))
                 b_inds = inds[start:end]
 
                 x = states[b_inds].to(self.device)
                 a = actions[b_inds].to(self.device)
 
-                dist = self.policy_n_value.get_dist(x)
-                newlogprob = dist.log_prob(a)
-                entropy = dist.entropy()
-                newvalue = self.policy_n_value.get_value(x)
-                
-                logratio = newlogprob - log_probs[b_inds].to(self.device)
-                ratio = logratio.exp()
+                with torch.cuda.amp.autocast(enabled=self.scaler.is_enabled()):
+                    dist = self.policy_n_value.get_dist(x)
+                    newlogprob = dist.log_prob(a)
+                    entropy = dist.entropy()
+                    newvalue = self.policy_n_value.get_value(x)
+                    
+                    logratio = newlogprob - log_probs[b_inds].to(self.device)
+                    ratio = logratio.exp()
 
-                # Policy loss
-                pg_obj1 = advantages[b_inds] * ratio
-                pg_obj2 = advantages[b_inds] * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
-                pg_loss = -torch.min(pg_obj1, pg_obj2).mean()
+                    # Policy loss
+                    pg_obj1 = advantages[b_inds] * ratio
+                    pg_obj2 = advantages[b_inds] * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
+                    pg_loss = -torch.min(pg_obj1, pg_obj2).mean()
 
-                # Value loss
-                v_loss = 0.5 * ((newvalue - returns[b_inds])**2).mean()
+                    # Value loss
+                    v_loss = 0.5 * ((newvalue - returns[b_inds])**2).mean()
 
-                # Entropy loss
-                entropy_loss = -entropy.mean()
+                    # Entropy loss
+                    entropy_loss = -entropy.mean()
 
-                # Combined loss
-                loss = pg_loss + 0.1 * entropy_loss
+                    # Combined loss
+                    loss = pg_loss + 0.1 * entropy_loss + v_loss
 
                 self.policy_optimizer.zero_grad(); self.value_optimizer.zero_grad()
-                loss.backward()
-                v_loss.backward()
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.policy_optimizer)
+                self.scaler.unscale_(self.value_optimizer)
                 nn.utils.clip_grad_norm_(self.policy_n_value.value_model.parameters(), max_grad_norm)
                 nn.utils.clip_grad_norm_(self.policy_n_value.policy_model.parameters(), max_grad_norm)
-                self.policy_optimizer.step(); self.value_optimizer.step()
+                self.scaler.step(self.policy_optimizer)
+                self.scaler.step(self.value_optimizer)
+                self.scaler.update()
 
                 # Approx kl
                 with torch.no_grad():
@@ -661,14 +683,14 @@ class PolicyValueRollout:
         step = 0
         while not done:
             # import pdb; pdb.set_trace()
-            # state = torch.cat([state["state"], state["action_mask"]], dim=0).float().to(self.policy_n_value.device)
-            state = state["state"].to(self.policy_n_value.device)
+            state = torch.cat([state["state"], state["action_mask"]], dim=0).float().to(self.policy_n_value.device)
+            # state = state["state"].to(self.policy_n_value.device)
             if not deterministic:
                 action, log_prob, _, value = self.policy_n_value.get_action_and_value(state.unsqueeze(0))
             else:
                 action, log_prob = self.policy_model.act(state, deterministic=True)
                 value = self.value_model(state.unsqueeze(0))
-            next_state, reward, done, truncated, info = self.env.step(action.item())
+            next_state, reward, done, truncated, _ = self.env.step(action.item())
             done = done or truncated
             trajectory.append((state, action, reward, log_prob, value))
             state = next_state
@@ -686,7 +708,8 @@ class Trainer:
     def __call__(self, num_iters:int=100):
         for iter in range(num_iters):
             start_time = time.time()
-            trajectories = [self.rollout() for _ in range(10)]
+            with torch.no_grad():
+                trajectories = [self.rollout() for _ in range(10)]
             learner_results = self.learner(trajectories)
             with torch.no_grad():
                 trj =  self.rollout(deterministic=True)
@@ -706,7 +729,8 @@ class Trainer:
                 "Iteration Time": end_time - start_time,
                 "Iteration": iter + 1,
                 "ppl_eval/W2": self.env.ppl,
-                "levels_sum": self.env.levels_sum
+                "levels_sum": sum(self.env.chosen_levels),
+                **{f"chosen_levels/{module_name}": level for module_name, level in zip(self.env.module_names, self.env.chosen_levels)},
             }
             wandb.log(data)
             print(f"Iteration {iter+1}/{num_iters}, Loss: {loss:.4f}, Rew: {rew:.2f}, Global Step: {learner_results['global_step']}, Time: {end_time - start_time:.2f}s")
@@ -748,10 +772,20 @@ def rlpress(model, calibration_data, eval_datasets):
     num_levels = 3
     N = 2 * num_levels + 1
     S = 2
-    env = Environment(model, eval_datasets[0], num_layers=12, num_layers_in_block=num_layers_in_block, num_levels=num_levels, weights_path=args["sparse_weights_path"])
+    # env = Environment(model, eval_datasets[0], num_layers=12, num_layers_in_block=num_layers_in_block, num_levels=num_levels, weights_path=args["sparse_weights_path"])
 
-    policy_model = Policy(state_size=S, action_size=N, device=device)
-    value_model = Value(state_size=S, device=device)
+    #model, test_data, num_blocks, model_blocks_attr, modules_in_block, num_levels, weights_path=""
+    model_blocks_attr = "model.decoder.layers"
+    modules_in_block = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj", "fc1", "fc2"]
+    num_levels = 8
+    num_blocks = model.config.num_hidden_layers
+    test_data = eval_datasets[0]
+    action_size = 2*num_levels + 1
+    state_size = 2 + action_size
+    env = Environment(model, test_data, num_blocks, model_blocks_attr, modules_in_block, num_levels, weights_path=args["sparse_weights_path"])
+    
+    policy_model = Policy(state_size=state_size, action_size=action_size, device=device)
+    value_model = Value(state_size=state_size, device=device)
 
     policy_n_value = PolicyValue(policy_model, value_model)
     policy_n_value.to(device)
@@ -761,11 +795,9 @@ def rlpress(model, calibration_data, eval_datasets):
     trainer = Trainer(env, policy_n_value, gamma=0.99, lam=0.95, lr=1e-3)
     trainer(400)
 
-
 model_name = "facebook/opt-125m"
 model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.float16, device_map="cuda")
 tokenizer = AutoTokenizer.from_pretrained(model_name)
-
 
 save_dir = f"logs/sparse_weights/{model_name.split('/')[-1]}"
 num_samples = 128
@@ -775,6 +807,5 @@ calib_data = get_fineweb_edu(num_tokens, sequence_length, tokenizer, train=True)
 _, test_data = get_w2_data(num_samples, sequence_length, tokenizer)
 eval_datasets = [test_data]
 
-breakpoint()
 # evopress(model, calib_data, eval_datasets)
 rlpress(model, calib_data, eval_datasets)
