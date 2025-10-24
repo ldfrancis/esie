@@ -10,301 +10,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import copy
 from tqdm import trange
 
-from utils import *
+from .utils import *
 
 try:
     import wandb
-
     has_wandb = True
 except ModuleNotFoundError:
     has_wandb = False
 
 
-def fix_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
 
-
-@torch.no_grad()
-def compute_kl_div(model, data, target_logits, batch_size: int = 1):
-    num_samples = len(data)
-    device = next(model.parameters()).device
-    # Running estimate of negative log-likelihood
-    kl_div_running = 0
-    # Number of tokens processed to far
-    tokens_processed = 0
-    # Loop through each batch
-    for i in trange(0, num_samples, batch_size, desc="Computing KL Divergence", leave=False):
-        torch.cuda.empty_cache()
-        j = min(i + batch_size, num_samples)
-       
-        inputs = torch.cat(data[i:j]).to(device)
-        targets = torch.cat(target_logits[i:j]).to(device)
-        # Forward pass through the model
-        lm_logits = model(inputs).logits
-
-        # Don't predict last token (not required, can be removed)
-        shift_logits = lm_logits[:, :-1, :].contiguous()
-        shift_targets = targets[:, :-1, :]
-        
-      
-        #Squeeze on GPU 
-        torch.cuda.empty_cache()
-        for i in range(0, shift_logits.shape[1], 1024):
-            j = min(i + 1024, shift_logits.shape[1])
-            shift_logits_batch = shift_logits[:, i:j, :]
-            shift_targets_batch = shift_targets[:, i:j, :]
-            loss_batch = F.kl_div(
-                shift_logits_batch.reshape(-1, shift_logits_batch.size(-1)).log_softmax(dim=-1),
-                shift_targets_batch.reshape(-1, shift_targets_batch.size(-1)).log_softmax(dim=-1),
-                log_target=True,
-                reduction="batchmean",
-            )
-            # Calculate negative log likelihood
-            a = shift_targets_batch.numel() / (tokens_processed + shift_targets_batch.numel())
-            b = tokens_processed / (tokens_processed + shift_targets_batch.numel())
-            kl_div_running = a * loss_batch + b * kl_div_running
-            # Update number of processed tokens
-            tokens_processed += shift_targets_batch.numel()
-            del shift_logits_batch, shift_targets_batch, loss_batch
-            torch.cuda.empty_cache()      
-        
- 
-    return kl_div_running.item()
-
-def load_layers(model: AutoModelForCausalLM, layer_names: List[str], new_state: List[int], sparse_weights_path: str):
-    assert hasattr(model, "state")
-    for layer_name, new_level, old_level in zip(layer_names, new_state, model.state):
-        if new_level != old_level:
-            layer = model.get_submodule(layer_name)
-            layer.weight.data = torch.load(
-                os.path.join(sparse_weights_path, layer_name, f"{new_level}.pth"), map_location=layer.weight.device
-            ).to(layer.weight.dtype)
-    # Update model state
-    model.state = new_state
-
-def load_modules(model: AutoModelForCausalLM, module_names: List[str], new_state: List[int], sparse_weights_path: str):
-    assert hasattr(model, "state")
-    for module_name, new_level, old_level in zip(module_names, new_state, model.state):
-        if new_level != old_level:
-            module = model.get_submodule(module_name)
-            module.weight.data = torch.load(
-                os.path.join(sparse_weights_path, module_name, f"{new_level}.pth"), map_location=module.weight.device
-            ).to(module.weight.dtype)
-    # Update model state
-    model.state = new_state
-
-def compute_fitness(model, data, fitness_fn, target_logits: Optional[torch.Tensor] = None) -> float:
-    if fitness_fn == "ppl":
-        return eval_ppl(model, data, data[0].shape[-1], device="cuda")
-    else:
-        return compute_kl_div(model, data, target_logits)
-
-
-
-def selection(
-    model,
-    layer_names,
-    sparse_weights_path: str,
-    candidates,
-    num_survive: int,
-    calibration_data,
-    num_tokens: int,
-    fitness_fn: str = "ppl",
-    target_logits: Optional[List[torch.Tensor]] = None,
-):
-    calibration_minibatch = []
-    minibatch_ids = []
-    target_logits_minibatch = []
-    tokens_used = 0
-    while tokens_used < num_tokens:  # generate minibatch with exactly num_tokens tokens
-        minibatch_id = random.randint(0, len(calibration_data) - 1)
-        if minibatch_id in minibatch_ids:  # avoid duplicates
-            continue
-        minibatch_ids.append(minibatch_id)
-        if tokens_used + calibration_data[minibatch_id].shape[1] > num_tokens:
-            calibration_minibatch.append(calibration_data[minibatch_id][:, : num_tokens - tokens_used])
-            if fitness_fn == "kl":
-                target_logits_minibatch.append(target_logits[minibatch_id][:, : num_tokens - tokens_used])
-            tokens_used = num_tokens
-        else:
-            calibration_minibatch.append(calibration_data[minibatch_id])
-            if fitness_fn == "kl":
-                target_logits_minibatch.append(target_logits[minibatch_id])
-            tokens_used += calibration_data[minibatch_id].shape[1]
-
-    if len(target_logits_minibatch) == 0:
-        target_logits_minibatch = None
-
-    fitnesses = []
-    for candidate in candidates:
-        load_layers(model, layer_names, candidate, sparse_weights_path)
-        fitness = compute_fitness(model, calibration_minibatch, fitness_fn, target_logits_minibatch)
-        fitnesses.append(fitness)
-    # Keep only best
-    best_ids = np.argsort(fitnesses)[:num_survive]
-    return [candidates[i] for i in best_ids], [fitnesses[i] for i in best_ids]
-
-
-
-def evopress(model, calibration_data, eval_datasets):
-    args = {
-        "log_wandb": True,
-        "seed": 0,
-        "dtype": "float16",
-        "model_name_or_path": "facebook/opt-125m",
-        "tokenizer_name": "facebook/opt-125m",
-        "memory_efficient": True,
-        "attn_implementation": "flash_attention_2",
-        "use_fast_tokenizer": True,
-        "calibration_data": "fineweb-edu",
-        "calibration_tokens": 128 * 2048,
-        "calibration_sequence_length": 2048,
-        "eval_datasets": ["wikitext", "c4"],
-        "eval_tokens": 128 * 2048,
-        "eval_sequence_length": 2048,
-        "fitness_fn": "kl",  # "ppl" or "kl"
-        "sparse_weights_path": "/home/user/esie/logs/sparse_weights/opt-125m/sparsegpt",
-        "generations": 400,
-        "offspring": 64,
-        "survivors_per_selection": [8, 2, 1],  # number of survivors after each selection step
-        "tokens_per_selection": [2048, 16284, 65536],  # number of tokens used to evaluate fitness at each selection step
-        "eval_every": 10,  # evaluate perplexity on eval datasets every N generations
-        "max_level": 99999,  # maximum absolute sparsity level per layer
-        "max_total_deviation": 99999,  # maximum total sparsity deviation (sum of absolute levels)
-
-
-    }
-    # Fix seed
-    fix_seed(args["seed"])
-    # Init W&B logger
-    if args["log_wandb"]:
-        assert has_wandb, "`wandb` not installed, try pip install `wandb`"
-        wandb.init(config=args)
-    # init device
-    device = f"cuda"
-    if args["dtype"] != "auto":
-        args["dtype"] = getattr(torch, args["dtype"])
-    
-    model.config.use_cache = False  # do not use cache
-  
-    target_logits = []
-    if args["fitness_fn"] == "kl":
-        # Compute target logits (calibration)
-        for i in trange(0, len(calibration_data), desc="Computing target logits (calib)", leave=False):
-            with torch.no_grad():
-                target_logits.append(model(calibration_data[i].to(device)).logits.cpu())
-
-    # Prepare layers and initial state
-    layer_names = []
-    for layer_name in sorted(os.listdir(args["sparse_weights_path"])):
-        if os.path.isdir(os.path.join(args["sparse_weights_path"], layer_name)):
-            layer_names.append(layer_name)
-    parent = [0 for _ in layer_names]
-    model.state = [None] * len(layer_names)
-
-    train_fitness = float("inf")
-    log_dict = {}
-    for generation in range(args["generations"]):
-        
-        print(f"Generation {generation + 1}/{args['generations']}")
-        print(f"Current search point: {parent}")
-        print(f"Train fitness: {train_fitness:.2e}")
-
-        load_layers(model, layer_names, parent, args["sparse_weights_path"])
-
-        # Evaluate current search point
-        if generation % args["eval_every"] == 0:
-            for eval_dataset_name, eval_dataset in zip(["W2"], eval_datasets):
-                sequence_length = eval_dataset[0].shape[-1]
-                ppl_eval = eval_ppl(model, eval_dataset, sequence_length, device="cuda")#compute_perplexity(model, eval_dataset)
-                print(f"{eval_dataset_name}: {ppl_eval:.2f}")
-                log_dict[f"ppl_eval/{eval_dataset_name}"] = ppl_eval
-            ppl_train = eval_ppl(model, calibration_data, calibration_data[0].shape[-1], device="cuda")#compute_perplexity(model, calibration_data)
-            print(f"ppl_train: {ppl_train:.2f}")
-            log_dict["ppl_train"] = ppl_train
-        if args["log_wandb"]:
-            wandb.log(log_dict)
-            # log_dict = {}
-
-        offspring_list = []
-
-        while len(offspring_list) < args["offspring"]:
-            offspring = copy.deepcopy(parent)
-            # mutate offspring
-            num_flips = min(random.randint(1, 3), random.randint(1, 3))  # bias towards lower values
-            for _ in range(num_flips):
-                # positions where sparsity can be decreased
-                while True:
-                    decr_id = random.randint(0, len(offspring) - 1)
-                    layer_name = layer_names[decr_id]
-                    level = offspring[decr_id]
-                    if abs(level - 1) > args["max_level"]:
-                        continue
-                    if os.path.exists(os.path.join(args["sparse_weights_path"], layer_name, f"{level - 1}.pth")):
-                        break
-                # positions where sparsity can be increased
-                while True:
-                    incr_id = random.randint(0, len(offspring) - 1)
-                    layer_name = layer_names[incr_id]
-                    level = offspring[incr_id]
-                    if abs(level + 1) > args["max_level"]:
-                        continue
-                    if os.path.exists(os.path.join(args["sparse_weights_path"], layer_name, f"{level + 1}.pth")):
-                        break
-                offspring[decr_id] -= 1
-                offspring[incr_id] += 1
-            # avoid duplicates
-            if offspring in offspring_list:
-                continue
-            # skip if total deviation exceeds specified threshold
-            if sum(map(abs, offspring)) > args["max_total_deviation"]:
-                continue
-            offspring_list.append(offspring)
-
-        for num_survive, num_tokens in zip(args["survivors_per_selection"], args["tokens_per_selection"]):
-            if num_survive == args["survivors_per_selection"][-1]:
-                if parent not in offspring_list:  # Elitist EA
-                    offspring_list.append(parent)
-
-            offspring_list, train_fitnesses = selection(
-                model=model,
-                layer_names=layer_names,
-                sparse_weights_path=args["sparse_weights_path"],
-                candidates=offspring_list,
-                num_survive=num_survive,
-                calibration_data=calibration_data,
-                num_tokens=num_tokens,
-                fitness_fn=args["fitness_fn"],
-                target_logits=target_logits,
-            )
-        # In the end we have lists with a single element (only 1 survivor in last selection step)
-        train_fitness = train_fitnesses[0]
-        parent = offspring_list[0]
-        print(f"Train fitnesses: {train_fitness:.2e}")
-        log_dict["train_fitness"] = train_fitness
-
-    # Save final configuration
-    with open(os.path.join(args["sparse_weights_path"], args["configuration_name"]), "w") as f:
-        f.write("\n".join([f"{layer_name}: {level}" for layer_name, level in zip(layer_names, parent)]))
-    # Log final configuration
-    print("Final configuration:")
-    print(parent)
-    # Final evaluation
-    for eval_dataset_name, eval_dataset in zip(["W2"], eval_datasets):
-        ppl_eval = eval_ppl(model, eval_dataset, eval_dataset[0].shape[-1], device="cuda")#compute_perplexity(model, eval_dataset)
-        print(f"{eval_dataset_name}: {ppl_eval:.2f}")
-        log_dict[f"ppl_eval/{eval_dataset_name}"] = ppl_eval
-    ppl_train = eval_ppl(model, calibration_data, calibration_data[0].shape[-1], device="cuda")#compute_perplexity(model, calibration_data)
-    print(f"ppl_train: {ppl_train:.2f}")
-    log_dict["ppl_train"] = ppl_train
-    if args["log_wandb"]:
-        wandb.log(log_dict)
-
-######################################################################################################################################
-# RLPress
 class Environment:
     def __init__(self, model, test_data, num_blocks, model_blocks_attr, modules_in_block, num_levels, weights_path=""):
         self.num_blocks = num_blocks
@@ -369,10 +84,10 @@ class Environment:
             ):
                 masks[i] = 0
             
-        masks = torch.tensor(masks, dtype=torch.float16)
+        masks = torch.tensor(masks, dtype=torch.float32)
         return {
             "state": torch.tensor(
-                [overall_module_idx/num_modules, cur_level_sum / (num_modules*self.num_levels)], dtype=torch.float16
+                [overall_module_idx/num_modules, cur_level_sum / (num_modules*self.num_levels)], dtype=torch.float32
             ),
             "action_mask": masks,
         }
@@ -401,6 +116,7 @@ class Environment:
 
         return self.get_state(), reward, done, False, {}
 
+
 class Policy(nn.Module):
     def __init__(self, state_size:int, action_size:int, device:str="cuda"):
         super(Policy, self).__init__()
@@ -423,11 +139,11 @@ class Policy(nn.Module):
         return super().to(device)
 
     def forward(self, state:Dict[str, torch.Tensor]) -> torch.Tensor:
-        large_neg = torch.finfo(state.dtype).min
         action_mask = state[:, -self.action_size:]
 
         x = self.base(state)
         logits = self.head(x)
+        large_neg = torch.finfo(logits.dtype).min
         logits = torch.where(action_mask.to(self.device) == 1, logits, large_neg)
         
         probs = F.softmax(logits, dim=-1)
@@ -503,6 +219,18 @@ class PolicyValue:
         return self.policy_model(x)
     
 
+def load_modules(model: AutoModelForCausalLM, module_names: List[str], new_state: List[int], sparse_weights_path: str):
+    assert hasattr(model, "state")
+    for module_name, new_level, old_level in zip(module_names, new_state, model.state):
+        if new_level != old_level:
+            module = model.get_submodule(module_name)
+            module.weight.data = torch.load(
+                os.path.join(sparse_weights_path, module_name, f"{new_level}.pth"), map_location=module.weight.device
+            ).to(module.weight.dtype)
+    # Update model state
+    model.state = new_state
+
+
 @torch.no_grad()
 def process_trajectory(trajectory, gamma, lam, device):
     lastgaelam = 0
@@ -555,7 +283,6 @@ def process_trajectories(trajectories, gamma, lam, device):
     values = torch.cat(values, dim=0)
     returns = torch.cat(returns, dim=0)
     advantages = torch.cat(advantages, dim=0)
-    # advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
     return states, actions, log_probs, values, returns, advantages
 
 class RLLearner:
@@ -565,7 +292,7 @@ class RLLearner:
         self.lam = lam
         self.device = device
         self.policy_optimizer = torch.optim.Adam(self.policy_n_value.policy_model.parameters(), lr=lr)
-        self.value_optimizer = torch.optim.Adam(self.policy_n_value.value_model.parameters(), lr=1e-5)
+        self.value_optimizer = torch.optim.Adam(self.policy_n_value.value_model.parameters(), lr=lr)
         self.global_step = 0
 
     def __call__(self, trajectories, epochs:int=5):
@@ -593,7 +320,6 @@ class RLLearner:
         for epoch in range(epochs):
             stop_updates = False
             np.random.shuffle(inds)
-            # self.policy_optimizer.zero_grad(); self.value_optimizer.zero_grad()
             for start in range(0, len(states), bs):
                 
                 end = min(start+bs, len(states))
@@ -648,10 +374,9 @@ class RLLearner:
                 approx_kls += [approx_kl.item()]
                 old_approx_kls += [old_approx_kl.item()]
 
-                # if approx_kl > target_kl:
-                #     stop_updates = True
-                #     break
-            # self.policy_optimizer.step(); self.value_optimizer.step()
+                if approx_kl > target_kl:
+                    stop_updates = True
+                    break
             if stop_updates:
                 break
 
@@ -666,7 +391,7 @@ class RLLearner:
         }
 
         return learner_results
-        
+
 
 class PolicyValueRollout:
     def __init__(self, env: Environment, policy_n_value: PolicyValue):
@@ -682,9 +407,7 @@ class PolicyValueRollout:
         trajectory = []
         step = 0
         while not done:
-            # import pdb; pdb.set_trace()
             state = torch.cat([state["state"], state["action_mask"]], dim=0).float().to(self.policy_n_value.device)
-            # state = state["state"].to(self.policy_n_value.device)
             if not deterministic:
                 action, log_prob, _, value = self.policy_n_value.get_action_and_value(state.unsqueeze(0))
             else:
@@ -698,12 +421,13 @@ class PolicyValueRollout:
 
 
 class Trainer:
-    def __init__(self, env: Environment, policy_n_value: PolicyValue, gamma: float = 0.99, lam: float = 0.95, lr: float = 1e-4):
+    def __init__(self, env: Environment, policy_n_value: PolicyValue, gamma: float = 0.99, lam: float = 0.95, lr: float = 1e-4, log_wandb: bool = True):
         self.env = env
         self.policy_n_value = policy_n_value
         self.learner = RLLearner(policy_n_value, gamma=gamma, lam=lam, lr=lr, device=policy_n_value.device)
         self.rollout = PolicyValueRollout(env, policy_n_value)
         self.best_score = -1e20
+        self.log_wandb = log_wandb
 
     def __call__(self, num_iters:int=100):
         for iter in range(num_iters):
@@ -713,7 +437,6 @@ class Trainer:
             learner_results = self.learner(trajectories)
             with torch.no_grad():
                 trj =  self.rollout(deterministic=True)
-                # trj = trajectories[0]
                 rew = sum(tran[2] for tran in trj)
                 if rew > self.best_score:
                     self.best_score = rew
@@ -721,7 +444,6 @@ class Trainer:
                     print(f"New best model saved with score {self.best_score}")
             end_time = time.time()
             loss = learner_results["learner/losses/policy_loss"]
-            # self.logger.log({**learner_results, "Score": rew}, step=learner_results["global_step"])
             data = {
                 **learner_results,
                 "Score": rew,
@@ -732,56 +454,22 @@ class Trainer:
                 "levels_sum": sum(self.env.chosen_levels),
                 **{f"chosen_levels/{module_name}": level for module_name, level in zip(self.env.module_names, self.env.chosen_levels)},
             }
-            wandb.log(data)
+            if self.log_wandb: wandb.log(data)
             print(f"Iteration {iter+1}/{num_iters}, Loss: {loss:.4f}, Rew: {rew:.2f}, Global Step: {learner_results['global_step']}, Time: {end_time - start_time:.2f}s")
             del trajectories, trj
             torch.cuda.empty_cache()
-            
-
-def rlpress(model, calibration_data, eval_datasets):
-    args = {
-        "log_wandb": True,
-        "seed": 0,
-        "dtype": "float16",
-        "model_name_or_path": "facebook/opt-125m",
-        "tokenizer_name": "facebook/opt-125m",
-        "memory_efficient": True,
-        "attn_implementation": "flash_attention_2",
-        "use_fast_tokenizer": True,
-        "calibration_data": "fineweb-edu",
-        "calibration_tokens": 128 * 2048,
-        "calibration_sequence_length": 2048,
-        "eval_datasets": ["wikitext", "c4"],
-        "eval_tokens": 128 * 2048,
-        "eval_sequence_length": 2048,
-        "fitness_fn": "kl",  # "ppl" or "kl"
-        "sparse_weights_path": "/home/user/esie/logs/sparse_weights/opt-125m/sparsegpt",
-        "generations": 400,
-        "offspring": 64,
-        "survivors_per_selection": [8, 2, 1],  # number of survivors after each selection step
-        "tokens_per_selection": [2048, 16284, 65536],  # number of tokens used to evaluate fitness at each selection step
-        "eval_every": 10,  # evaluate perplexity on eval datasets every N generations
-        "max_level": 99999,  # maximum absolute sparsity level per layer
-        "max_total_deviation": 99999,  # maximum total sparsity deviation (sum of absolute levels)
-        "self_competition": True,
 
 
-    }
-    device = "cuda"
-    num_layers_in_block = 6
-    num_levels = 3
-    N = 2 * num_levels + 1
-    S = 2
-    # env = Environment(model, eval_datasets[0], num_layers=12, num_layers_in_block=num_layers_in_block, num_levels=num_levels, weights_path=args["sparse_weights_path"])
-
-    #model, test_data, num_blocks, model_blocks_attr, modules_in_block, num_levels, weights_path=""
-    model_blocks_attr = "model.decoder.layers"
-    modules_in_block = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj", "fc1", "fc2"]
-    num_levels = 8
-    num_blocks = model.config.num_hidden_layers
-    test_data = eval_datasets[0]
-    action_size = 2*num_levels + 1
+def rl_run(model, calibration_data, eval_datasets, args):
+    model_blocks_attr = args["model_blocks_attr"]
+    modules_in_block = args["modules_in_block"]
+    num_levels = args["num_levels"]
+    num_blocks = args["num_blocks"]
+    test_data = args["test_data"]
+    action_size = args["action_size"]
     state_size = 2 + action_size
+    device = "cuda"
+
     env = Environment(model, test_data, num_blocks, model_blocks_attr, modules_in_block, num_levels, weights_path=args["sparse_weights_path"])
     
     policy_model = Policy(state_size=state_size, action_size=action_size, device=device)
@@ -792,20 +480,5 @@ def rlpress(model, calibration_data, eval_datasets):
 
     if args["log_wandb"]:
         wandb.init(config=args)
-    trainer = Trainer(env, policy_n_value, gamma=0.99, lam=0.95, lr=1e-3)
+    trainer = Trainer(env, policy_n_value, gamma=0.99, lam=0.95, lr=args["lr"], log_wandb=args["log_wandb"])
     trainer(400)
-
-model_name = "facebook/opt-125m"
-model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.float16, device_map="cuda")
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-save_dir = f"logs/sparse_weights/{model_name.split('/')[-1]}"
-num_samples = 128
-sequence_length = 2048
-num_tokens = num_samples * sequence_length
-calib_data = get_fineweb_edu(num_tokens, sequence_length, tokenizer, train=True)
-_, test_data = get_w2_data(num_samples, sequence_length, tokenizer)
-eval_datasets = [test_data]
-
-# evopress(model, calib_data, eval_datasets)
-rlpress(model, calib_data, eval_datasets)

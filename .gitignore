@@ -14,3 +14,7 @@ weights/
 
 __pycache__/
 notebooks/logs
+
+# ignore logs folder
+logs/
+best_policy.pt

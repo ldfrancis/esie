@@ -1,26 +1,10 @@
-from utils import *
+from .utils import *
 import time
 
-sparsity = 0.5
-weights_diff = 20_000
-num_levels = 8
-
-
-model_name = "facebook/opt-125m"
-model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.float16, device_map="cpu")
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-
-save_dir = f"logs/sparse_weights/{model_name.split('/')[-1]}"
-num_samples = 128
-sequence_length = 2048
-num_tokens = num_samples * sequence_length
-calib_data = get_fineweb_edu(num_tokens, sequence_length, tokenizer, train=True)
-_, test_data = get_w2_data(num_samples, sequence_length, tokenizer)
 
 
 @torch.no_grad()
-def prune_press(model, calib_data, sparsity_ratio, weights_diff, num_levels, theta1=0.42, theta2=0.51, theta3=0.38, is_sparsegpt=False, device=torch.device("cuda:0"), save_dir=""):
+def prune_levels(model, calib_data, sparsity, weights_diff, num_levels, theta1=0.42, theta2=0.51, theta3=0.38, is_sparsegpt=False, device=torch.device("cuda:0"), save_dir=""):
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
 
@@ -50,7 +34,6 @@ def prune_press(model, calib_data, sparsity_ratio, weights_diff, num_levels, the
 
         wrapped_layers = {}
         for name in subset:
-            # print(subset[name].weight.device)
             wrapped_layers[name] = WrappedGPT(subset[name], theta1=theta1, theta2=theta2, theta3=theta3, is_sparsegpt=is_sparsegpt)
 
         def add_batch(name):
@@ -65,7 +48,6 @@ def prune_press(model, calib_data, sparsity_ratio, weights_diff, num_levels, the
         for j in range(NUM_SAMPLES):
             with torch.no_grad():
                 ins = inps[j].unsqueeze(0).to(device)
-                # print(ins.device, next(layer.parameters()).device)
                 outs[j] = layer(ins, **kwargs)[0].detach().cpu()
         for h in handles:
             h.remove()
@@ -84,6 +66,7 @@ def prune_press(model, calib_data, sparsity_ratio, weights_diff, num_levels, the
                     modify=False
                 
                 weight = wrapped_layers[name].prune(sparsity_ratio, modify=modify)
+                assert (((weight == 0).float().sum() / weight.numel()).item() - sparsity_ratio) < 1e-2, f"Sparsity level mismatch: expected {sparsity_ratio}, got {((weight == 0).float().sum() / weight.numel()).item()}"
 
                 # save weight to disk
                 if save_dir:
@@ -95,25 +78,16 @@ def prune_press(model, calib_data, sparsity_ratio, weights_diff, num_levels, the
                     torch.save(weight, save_file)
             wrapped_layers[name].clean()
 
-        # outs_cache = outs.clone()
         for j in range(NUM_SAMPLES):
             with torch.no_grad():
                 outs[j] = layer(inps[j].unsqueeze(0).to(device), **kwargs)[0].detach().cpu()
 
-        # layer_recon_error = ((outs_cache.float() - outs.float())**2).sum().item()
-        
-        # reconstruction_errors += [layer_recon_error]
-        # print(f"Layer {i} reconstruction error: {layer_recon_error}")
         inps, outs = outs, inps
-        # layer.to("cpu")
+        layer.to("cpu")
+        del layer
         gc.collect()
         torch.cuda.empty_cache()
 
     model.config.use_cache = use_cache 
 
     return reconstruction_errors
-
-start = time.time()
-prune_press(model, calib_data, sparsity, weights_diff, num_levels, theta1=0.42, theta2=0.51, theta3=0.38, is_sparsegpt=True, device=torch.device("cuda"), save_dir=save_dir)
-time_taken = time.time() - start
-print(f"Time taken: {time_taken/60:.2f} minutes")
